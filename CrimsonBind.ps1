@@ -192,11 +192,17 @@ function Import-CsvToRows {
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $rows }
     $csv = Import-Csv -LiteralPath $Path -Encoding UTF8
     foreach ($r in $csv) {
-        $sec = if ($r.Section) { $r.Section.Trim() } else { "" }
-        $act = if ($r.ActionName) { $r.ActionName.Trim() } else { "" }
-        $key = if ($r.BindPadKey) { $r.BindPadKey.Trim() } else { if ($r.Key) { $r.Key.Trim() } else { "" } }
-        $mac = if ($r.MacroText) { $r.MacroText.Trim() } else { "" }
-        $tex = if ($r.TextureID) { $r.TextureID.Trim() } else { "132089" }
+        # Normalize property access (Excel may save UTF-8 BOM; first column can be ﻿Section)
+        $sec = $null; $act = $null; $key = $null; $mac = $null; $tex = $null
+        foreach ($p in $r.PSObject.Properties) {
+            $name = $p.Name -replace '^\x{FEFF}', ''
+            switch -Regex ($name) { '^Section$' { $sec = $p.Value } '^ActionName$' { $act = $p.Value } '^BindPadKey$' { $key = $p.Value } '^Key$' { if (-not $key) { $key = $p.Value } } '^MacroText$' { $mac = $p.Value } '^TextureID$' { $tex = $p.Value } }
+        }
+        $sec = if ($sec) { $sec.ToString().Trim() } else { "" }
+        $act = if ($act) { $act.ToString().Trim() } else { "" }
+        $key = if ($key) { $key.ToString().Trim() } else { "" }
+        $mac = if ($mac) { $mac.ToString().Trim() } else { "" }
+        $tex = if ($tex) { $tex.ToString().Trim() } else { "132089" }
         if ($sec -and $act) {
             [void]$rows.Add([PSCustomObject]@{ Section = $sec; ActionName = $act; MacroText = $mac; Key = $key; TextureID = $tex })
         }
@@ -589,15 +595,23 @@ function Get-DebounceGeneralSectionLua {
     return $sb.ToString().TrimEnd()
 }
 
-# Build full class table: tabs 1,2,3 and optionally [0]. Do not use for GENERAL.
+# Number of spec tabs per class (so tab index matches Holy/Protection/Retribution etc.).
+$Script:DebounceClassTabCount = @{
+    "PALADIN" = 3; "ROGUE" = 3; "DEATHKNIGHT" = 3; "DEMONHUNTER" = 2; "DRUID" = 4; "EVOKER" = 3
+    "HUNTER" = 3; "MAGE" = 3; "MONK" = 3; "PRIEST" = 3; "SHAMAN" = 3; "WARLOCK" = 3; "WARRIOR" = 3
+}
+
+# Build full class table: tabs 1..N (empty tabs filled so Retribution = tab 3 etc.), optionally [0]. Do not use for GENERAL.
 function Get-DebounceSectionTableLua {
     param([string]$ClassKey, [hashtable]$TabsByIndex)
+    $maxTab = $Script:DebounceClassTabCount[$ClassKey]
+    if (-not $maxTab) { $maxTab = 3 }
+    $emptyTabLua = Get-DebounceTabLua -Rows ([System.Collections.ArrayList]::new())
     $sb = [System.Text.StringBuilder]::new()
     [void]$sb.Append("[""$ClassKey""] = {")
     $sb.AppendLine()
-    $tabIndices = @($TabsByIndex.Keys | Where-Object { $_ -ne 0 } | Sort-Object)
-    foreach ($idx in $tabIndices) {
-        $tabLua = $TabsByIndex[$idx]
+    for ($idx = 1; $idx -le $maxTab; $idx++) {
+        $tabLua = if ($TabsByIndex[$idx]) { $TabsByIndex[$idx] } else { $emptyTabLua }
         [void]$sb.AppendLine($tabLua)
     }
     if ($TabsByIndex[0]) {

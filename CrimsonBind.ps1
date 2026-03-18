@@ -33,6 +33,7 @@ $ToolDir = $PSScriptRoot
 $Script:BackupRoot = Join-Path $ToolDir "BACKUP"
 $Script:ExcludedKeysPath = Join-Path $ToolDir "excluded_keys.csv"
 $Script:EnableLogging = $false   # Set $true to write log file under ToolDir\Logs
+$Script:ConfigIniKeySuffix = "67701769"   # Suffix for config.ini key format (e.g. +vk70_67701769)
 
 # Optional: write to log file for diagnostics. No-op if $Script:EnableLogging is $false.
 function Write-CrimsonBindLog {
@@ -48,6 +49,37 @@ function Write-CrimsonBindLog {
 }
 
 # ---------- Config.ini read/write ----------
+# Map CSV key names to config.ini code part (vk = virtual key, sc = scan code). Used by ConvertTo-ConfigIniKey.
+$Script:ConfigIniKeyCodeMap = @{
+    "F1"="vk70"; "F2"="vk71"; "F3"="vk72"; "F4"="vk73"; "F5"="vk74"; "F6"="vk75"; "F7"="vk76"; "F8"="vk77"; "F9"="vk78"; "F10"="vk79"; "F11"="vk7a"; "F12"="vk7b"
+    "0"="vk30"; "1"="vk31"; "2"="vk32"; "3"="vk33"; "4"="vk34"; "5"="vk35"; "6"="vk36"; "7"="vk37"; "8"="vk38"; "9"="vk39"
+    "MINUS"="vkbd"; "EQUALS"="vkbb"
+    "A"="sc1e"; "B"="sc30"; "C"="sc2e"; "D"="sc20"; "E"="sc12"; "F"="sc21"; "G"="sc22"; "H"="sc23"; "I"="sc17"; "J"="sc24"; "K"="sc25"; "L"="sc26"; "M"="sc32"; "N"="sc31"; "O"="sc18"; "P"="sc19"; "Q"="sc10"; "R"="sc13"; "S"="sc1f"; "T"="sc14"; "U"="sc16"; "V"="sc2f"; "W"="sc11"; "X"="sc2d"; "Y"="sc15"; "Z"="sc2c"
+    "LBRACKET"="vkdb"; "RBRACKET"="vkdd"; "BACKSLASH"="vkdc"; "SEMICOLON"="vkba"; "APOSTROPHE"="vkde"; "COMMA"="vkbc"; "PERIOD"="vkbe"; "SLASH"="vkbf"
+    "NUMPAD0"="vk60"; "NUMPAD1"="sc4f"; "NUMPAD2"="sc50"; "NUMPAD3"="sc51"; "NUMPAD4"="vk64"; "NUMPAD5"="vk65"; "NUMPAD6"="vk66"; "NUMPAD7"="sc47"; "NUMPAD8"="vk68"; "NUMPAD9"="sc49"
+}
+# Convert CSV key (e.g. F1, SHIFT-F1, ALT-K) to config.ini format (e.g. +vk70_67701769). Pass through if already in config format.
+function ConvertTo-ConfigIniKey {
+    param([string]$Key, [string]$Suffix = $Script:ConfigIniKeySuffix)
+    $k = ($Key -replace "^\s+|\s+$", "")
+    if (-not $k) { return $k }
+    if ($k -match '_[0-9a-fA-F]+$' -and ($k -match 'vk[0-9a-fA-F]+' -or $k -match 'sc[0-9a-fA-F]+')) { return $k }
+    $parts = $k -split '-'
+    $hasCtrl = $false; $hasAlt = $false; $hasShift = $false
+    $base = $null
+    foreach ($p in $parts) {
+        $t = $p.Trim().ToUpperInvariant()
+        if ($t -eq 'CTRL') { $hasCtrl = $true } elseif ($t -eq 'ALT') { $hasAlt = $true } elseif ($t -eq 'SHIFT') { $hasShift = $true } else { $base = $p.Trim(); break }
+    }
+    if (-not $base -and $parts.Count -gt 0) { $base = $parts[-1].Trim() }
+    if (-not $base) { return $k }
+    $code = $Script:ConfigIniKeyCodeMap[$base]
+    if (-not $code) { $code = $Script:ConfigIniKeyCodeMap[$base.ToUpperInvariant()] }
+    if (-not $code) { return $k }
+    $modStr = ""; if ($hasCtrl) { $modStr += "^" }; if ($hasAlt) { $modStr += "!" }; if ($hasShift) { $modStr += "+" }
+    return $modStr + $code + "_" + $Suffix
+}
+
 function Get-ConfigIniSectionsAndBinds {
     param([string]$ConfigPath)
     $out = [System.Collections.ArrayList]::new()
@@ -85,12 +117,29 @@ function Get-ConfigIniSectionsAndBinds {
 }
 
 function Set-ConfigIniFromRows {
-    param([string]$ConfigPath, [System.Collections.ArrayList]$Rows)
+    param([string]$ConfigPath, [System.Collections.ArrayList]$Rows, [string]$OnlySection = $null)
     if (-not (Test-Path -LiteralPath $ConfigPath -PathType Leaf)) { return -1 }
+    $generalByActionName = @{}
+    foreach ($r in $Rows) {
+        if ($r.Section -eq "General") { $generalByActionName[$r.ActionName] = [PSCustomObject]@{ Key = $r.Key; MacroText = $r.MacroText } }
+    }
     $keyMap = @{}
     foreach ($r in $Rows) {
         $k = "$($r.Section)|$($r.ActionName)"
-        $keyMap[$k] = [PSCustomObject]@{ Key = $r.Key; MacroText = $r.MacroText }
+        if ($r.Section -eq "General") {
+            $keyMap[$k] = [PSCustomObject]@{ Key = $r.Key; MacroText = $r.MacroText }
+        } elseif ($generalByActionName.ContainsKey($r.ActionName)) {
+            $keyMap[$k] = $generalByActionName[$r.ActionName]
+        } else {
+            $keyMap[$k] = [PSCustomObject]@{ Key = $r.Key; MacroText = $r.MacroText }
+        }
+    }
+    # When updating only one section, ensure General's keys apply for every General action in that section
+    # (so target binds etc. are taken from General even if the CSV has no class row for that action).
+    if ($OnlySection -and $OnlySection -ne "General") {
+        foreach ($actionName in $generalByActionName.Keys) {
+            $keyMap["$OnlySection|$actionName"] = $generalByActionName[$actionName]
+        }
     }
     $content = [System.IO.File]::ReadAllText($ConfigPath, [System.Text.Encoding]::Unicode)
     $lines = $content -split "`r?`n"
@@ -108,9 +157,11 @@ function Set-ConfigIniFromRows {
             $actionName = $Matches[1].Trim()
             $value = $Matches[2].Trim()
             $key = "$currentSection|$actionName"
-            if ($actionName -and $keyMap.ContainsKey($key)) {
+            $inTargetSection = -not $OnlySection -or ($currentSection -eq $OnlySection)
+            if ($inTargetSection -and $actionName -and $keyMap.ContainsKey($key)) {
                 $info = $keyMap[$key]
-                $newVal = $info.Key
+                $configKey = ConvertTo-ConfigIniKey -Key $info.Key -Suffix $Script:ConfigIniKeySuffix
+                $newVal = $configKey
                 if ($info.MacroText) { $newVal += "; $($info.MacroText)" }
                 [void]$newLines.Add($Matches[1] + "=" + $newVal)
                 $replaced++
@@ -608,6 +659,10 @@ function Export-DebounceFromRows {
     } else {
         foreach ($r in $Rows) { [void]$rowsToUse.Add($r) }
     }
+    $generalActionNames = @{}
+    foreach ($r in $Rows) {
+        if ($r.Section -eq "General") { $generalActionNames[$r.ActionName] = $true }
+    }
     $byClassTab = @{}
     foreach ($r in $rowsToUse) {
         $map = Get-DebounceSectionMapping -Section $r.Section
@@ -631,7 +686,11 @@ function Export-DebounceFromRows {
         $tabs = $byClassTab[$ck]
         $tabLuaByIndex = @{}
         foreach ($idx in $tabs.Keys) {
-            $tabLuaByIndex[$idx] = Get-DebounceTabLua -Rows $tabs[$idx]
+            $filtered = [System.Collections.ArrayList]::new()
+            foreach ($r in $tabs[$idx]) {
+                if (-not $generalActionNames.ContainsKey($r.ActionName)) { [void]$filtered.Add($r) }
+            }
+            $tabLuaByIndex[$idx] = Get-DebounceTabLua -Rows $filtered
         }
         $newBindSections[$ck] = Get-DebounceSectionTableLua -ClassKey $ck -TabsByIndex $tabLuaByIndex
     }
@@ -674,6 +733,14 @@ function Update-GridFromRows {
     if ($null -eq $SearchText -and $Script:GridSearchText) { $SearchText = $Script:GridSearchText }
     $keyList = [System.Collections.ArrayList]::new()
     foreach ($k in (Get-FullKeyPool)) { [void]$keyList.Add($k) }
+    # Include F1–F12 and common modifier combos so General target binds (F12, SHIFT-F12, CTRL-F12, etc.) always appear in the Key dropdown
+    foreach ($fk in @("F1","F2","F3","F4","F5","F6","F7","F8","F9","F10","F11","F12")) {
+        if ($keyList -notcontains $fk) { [void]$keyList.Add($fk) }
+        foreach ($mod in @("SHIFT-","CTRL-","ALT-")) {
+            $c = $mod + $fk
+            if ($keyList -notcontains $c) { [void]$keyList.Add($c) }
+        }
+    }
     foreach ($r in $Rows) {
         $k = if ($r.Key) { $r.Key.Trim() } else { "" }
         if ($k -and $keyList -notcontains $k) { [void]$keyList.Add($k) }
@@ -685,9 +752,14 @@ function Update-GridFromRows {
         $keyCol.DataSource = [object[]]$keyList
     }
     $Grid.Rows.Clear()
+    $generalActionNames = @{}
+    if ($FilterSection -and $FilterSection -ne "General") {
+        foreach ($r in $Rows) { if ($r.Section -eq "General") { $generalActionNames[$r.ActionName] = $true } }
+    }
     $search = if ($SearchText) { $SearchText.Trim() } else { "" }
     foreach ($r in $Rows) {
         if ($FilterSection -and $r.Section -ne $FilterSection) { continue }
+        if ($FilterSection -and $FilterSection -ne "General" -and $generalActionNames.ContainsKey($r.ActionName)) { continue }
         if ($search) {
             $s = if ($r.Section) { $r.Section } else { "" }
             $a = if ($r.ActionName) { $r.ActionName } else { "" }
@@ -703,9 +775,14 @@ function Update-GridFromRows {
 
 function Sync-GridToRows {
     param($Grid, [System.Collections.ArrayList]$Rows, [string]$FilterSection)
+    $generalActionNames = @{}
+    if ($FilterSection -and $FilterSection -ne "General") {
+        foreach ($r in $Rows) { if ($r.Section -eq "General") { $generalActionNames[$r.ActionName] = $true } }
+    }
     $key = 0
     foreach ($r in $Rows) {
         if ($FilterSection -and $r.Section -ne $FilterSection) { continue }
+        if ($FilterSection -and $FilterSection -ne "General" -and $generalActionNames.ContainsKey($r.ActionName)) { continue }
         if ($key -lt $Grid.Rows.Count) {
             $cellKey = $Grid.Rows[$key].Cells["Key"].Value
             $cellMac = $Grid.Rows[$key].Cells["MacroText"].Value
@@ -1076,8 +1153,9 @@ $btnClearSearch.Location = New-Object System.Drawing.Point(465, 6)
 [void]$gridPanel.Controls.Add($txtGridSearch)
 [void]$gridPanel.Controls.Add($btnSearch)
 [void]$gridPanel.Controls.Add($btnClearSearch)
-[void]$gridForm.Controls.Add($gridPanel)
+# Add Fill (grid) first, then Bottom (toolbar) so the grid client area stops above the bar — not under it.
 [void]$gridForm.Controls.Add($dgv)
+[void]$gridForm.Controls.Add($gridPanel)
 $gridForm.Add_FormClosing({
     param($sender, $e)
     if ($form.Visible) { $e.Cancel = $true; $sender.Hide() }
@@ -1172,8 +1250,8 @@ $btnUpdateConfig.Add_Click({
     Sync-GridToRows -Grid $dgv -Rows $Script:AllRows -FilterSection $filter
     if (-not $Script:ConfigPath -or -not (Test-Path -LiteralPath $Script:ConfigPath -PathType Leaf)) { $lblStatus.Text = "Select config.ini first."; return }
     try {
-        $n = Set-ConfigIniFromRows -ConfigPath $Script:ConfigPath -Rows $Script:AllRows
-        $lblStatus.Text = "Updated $n keybinds in config.ini."
+        $n = Set-ConfigIniFromRows -ConfigPath $Script:ConfigPath -Rows $Script:AllRows -OnlySection $filter
+        if ($filter) { $lblStatus.Text = "Updated $n keybinds in config.ini (section: $filter)." } else { $lblStatus.Text = "Updated $n keybinds in config.ini." }
     } catch {
         $lblStatus.Text = "Error updating config.ini: $_"
         Write-CrimsonBindLog -Message "Set-ConfigIniFromRows failed: $_" -Level "Error"

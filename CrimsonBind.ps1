@@ -193,9 +193,10 @@ function Import-CsvToRows {
     $csv = Import-Csv -LiteralPath $Path -Encoding UTF8
     foreach ($r in $csv) {
         # Normalize property access (Excel may save UTF-8 BOM; first column can be ﻿Section)
+        $bom = [char]0xFEFF
         $sec = $null; $act = $null; $key = $null; $mac = $null; $tex = $null
         foreach ($p in $r.PSObject.Properties) {
-            $name = $p.Name -replace '^\x{FEFF}', ''
+            $name = $p.Name.TrimStart($bom)
             switch -Regex ($name) { '^Section$' { $sec = $p.Value } '^ActionName$' { $act = $p.Value } '^BindPadKey$' { $key = $p.Value } '^Key$' { if (-not $key) { $key = $p.Value } } '^MacroText$' { $mac = $p.Value } '^TextureID$' { $tex = $p.Value } }
         }
         $sec = if ($sec) { $sec.ToString().Trim() } else { "" }

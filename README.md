@@ -29,6 +29,31 @@ Other sources may distribute modified or unsafe versions.
 
 ---
 
+## How General and spec bindings work
+
+Many actions exist in both the **General** section and in each class/spec section (e.g. racials, Target Member1–40, Focus Party/Arena, Trinket Rotation, Universal, Potion). The script treats General as the single source of truth for those shared actions.
+
+### Key and macro source
+
+- When writing to **config.ini** or validating duplicates, the script builds a key map: for every section, if a row’s **ActionName** exists in General, it uses **General’s Key and MacroText** for that action in that section. Spec rows with the same action name do not override General; they effectively “inherit” General’s bind.
+- So: configure shared binds (targeting, focus, racials, consumables, etc.) once in **General**; that key and macro apply to every spec that has that action.
+
+### Grid behaviour when a spec is selected
+
+- When you filter the grid by a class/spec (e.g. Paladin - Retribution), rows whose action exists in General show **General’s Key and MacroText** in the grid (read-only display for those rows).
+- **Saving from the grid** (e.g. after editing) only writes back Key/MacroText for **spec-only** rows. Rows that inherit from General are not updated from the grid when you’re viewing a spec — so you don’t accidentally overwrite them. To change a shared bind, switch to the **General** section and edit it there.
+
+### Apply general keybinds (grid toolbar)
+
+- The **Apply general keybinds** button copies General’s **Key** and **MacroText** to every non-General row that has the same **ActionName**. Use it after you’ve edited General and want all specs to match without opening each section. Then use **Save to CSV** to persist.
+
+### Duplicate detection
+
+- A “duplicate” is one key bound to two or more different actions **in the same section**. The duplicate list and red highlighting are per-section.
+- Rows that inherit from General (same ActionName as a General row) are **excluded** from duplicate counting in that section, so they don’t create false duplicates. The effective key for those rows is General’s key.
+
+---
+
 ## 🚀 Features
 
 ### 📤 Import / Export
@@ -41,16 +66,20 @@ Other sources may distribute modified or unsafe versions.
   - Action  
   - Key  
   - MacroText  
-- Includes filtering and search  
+- Filter by section and search  
+- Key column has a **blank option at the top** of the dropdown to clear the key  
 
 ### 🎹 Key Selection
 - Dropdown-based key selection  
 - Prevent invalid/manual entry issues  
 - Supports **exclusion lists**  
+- F1–F12 and common modifier combos are always in the list (for General target/focus binds)  
 
 ### 🎲 Smart Randomisation
-- Randomise keys by section  
-- Respects excluded key combinations  
+- **Randomize keys** (main form, with a section selected): randomises only the **spec-only** rows in that section. Rows that inherit from General (Target Member, racials, Universal, etc.) are **skipped** so their keys are not overwritten and duplicates are not introduced. Each randomised row gets a unique key from the pool (General’s keys are excluded when the section is a spec).
+- **Randomize selected** (grid toolbar): only the selected rows that are **not** General-bound actions get new keys. Same skip rule and pool rules as above.
+- **Randomize all** (main form, no section filter): General is randomised first from the full key pool; then each spec is randomised from a pool that excludes General’s keys (no duplicates within a section, and no overlap with General).
+- Respects **exclusion lists** (excluded key combos are not assigned).  
 
 ### ⚙️ Config Integration
 - Write changes back to:
@@ -68,5 +97,5 @@ Other sources may distribute modified or unsafe versions.
 - Restore from previous snapshots  
 
 ### 🚫 Exclusions System
-- Prevent specific key combos from being used  
-- Stored in:
+- Prevent specific key combos from being used when randomising or assigning keys.  
+- Excluded keys are stored in a file next to the script and are respected by all randomise operations.

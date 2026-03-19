@@ -458,8 +458,17 @@ function Invoke-RandomizeKeys {
 
     if ($OnlySection) {
         # Randomize only the selected section; unique keys within section and do not use keys bound in General
+        # For a spec section, exclude rows that inherit key from General (Target Member, racials, etc.) so we don't overwrite them
+        $generalActionNames = @{}
+        foreach ($r in $Rows) {
+            if ($r.Section -eq "General") { $generalActionNames[$r.ActionName] = $true }
+        }
         $targetRows = [System.Collections.ArrayList]::new()
-        foreach ($r in $Rows) { if ($r.Section -eq $OnlySection) { [void]$targetRows.Add($r) } }
+        foreach ($r in $Rows) {
+            if ($r.Section -ne $OnlySection) { continue }
+            if ($OnlySection -ne "General" -and $generalActionNames.ContainsKey($r.ActionName)) { continue }
+            [void]$targetRows.Add($r)
+        }
         $pool = if ($OnlySection -eq "General") { $fullPool } else { $poolWithoutGeneral }
         $shuffled = [System.Collections.ArrayList]::new()
         foreach ($k in ($pool | Sort-Object { $rng.Next() })) { [void]$shuffled.Add($k) }
@@ -577,6 +586,27 @@ function Invoke-RandomizeSelectedGridRows {
         }
     }
     return $assigned
+}
+
+function Invoke-ApplyGeneralKeybindsToAllSections {
+    param([System.Collections.ArrayList]$Rows)
+    if (-not $Rows -or $Rows.Count -eq 0) { return 0 }
+    $generalByActionName = @{}
+    foreach ($r in $Rows) {
+        if ($r.Section -eq "General") {
+            $generalByActionName[$r.ActionName] = [PSCustomObject]@{ Key = $r.Key; MacroText = $r.MacroText }
+        }
+    }
+    $updated = 0
+    foreach ($r in $Rows) {
+        if ($r.Section -eq "General") { continue }
+        if (-not $generalByActionName.ContainsKey($r.ActionName)) { continue }
+        $g = $generalByActionName[$r.ActionName]
+        $r.Key = $g.Key
+        $r.MacroText = $g.MacroText
+        $updated++
+    }
+    return $updated
 }
 
 # ---------- Lua helpers (Get-LuaEscaped used by Debounce export) ----------
@@ -1333,7 +1363,7 @@ function Show-ExclusionsDialog {
 # Summary of changes: (1) TableLayoutPanel + FlowLayoutPanel for responsive layout and consistent padding. (2) Segoe UI 9pt. (3) Extracted GUI helpers and Exclusions dialog. (4) Input validation and user-facing error messages. (5) Optional logging when $Script:EnableLogging is $true.
 # Future improvements: tooltips on buttons; "Open folder" for config/CSV path; single-window layout (grid in tab or splitter); configurable paths in a small settings file.
 $form = New-Object System.Windows.Forms.Form
-$form.Text = "Crimson Binds"
+$form.Text = "Crimson Binds 1.01"
 $form.Size = New-Object System.Drawing.Size(740, 360)
 $form.StartPosition = "CenterScreen"
 $form.MinimumSize = New-Object System.Drawing.Size(520, 340)
@@ -1504,7 +1534,7 @@ $mainTable.SetColumnSpan($lblStatus, 3)
 
 # Data grid in a separate window (toolbar uses Panel; no GroupBox)
 $gridForm = New-Object System.Windows.Forms.Form
-$gridForm.Text = "Crimson Binds - Data Grid (Section / Action / Key / MacroText)"
+$gridForm.Text = "Crimson Binds 1.01 - Data Grid (Section / Action / Key / MacroText)"
 $gridForm.Size = New-Object System.Drawing.Size(720, 420)
 $gridForm.StartPosition = [System.Windows.Forms.FormStartPosition]::Manual
 $gridForm.MinimumSize = New-Object System.Drawing.Size(400, 200)
@@ -1565,13 +1595,17 @@ $btnRandomizeSelected = New-Object System.Windows.Forms.Button
 $btnRandomizeSelected.Text = "Randomize selected"
 $btnRandomizeSelected.Size = New-Object System.Drawing.Size(110, 26)
 $btnRandomizeSelected.Location = New-Object System.Drawing.Point(210, 6)
+$btnApplyGeneralKeybinds = New-Object System.Windows.Forms.Button
+$btnApplyGeneralKeybinds.Text = "Apply general keybinds"
+$btnApplyGeneralKeybinds.Size = New-Object System.Drawing.Size(140, 26)
+$btnApplyGeneralKeybinds.Location = New-Object System.Drawing.Point(326, 6)
 $lblSearch = New-Object System.Windows.Forms.Label
 $lblSearch.Text = "Search:"
 $lblSearch.AutoSize = $true
-$lblSearch.Location = New-Object System.Drawing.Point(326, 10)
+$lblSearch.Location = New-Object System.Drawing.Point(472, 10)
 $txtGridSearch = New-Object System.Windows.Forms.TextBox
 $txtGridSearch.Size = New-Object System.Drawing.Size(140, 22)
-$txtGridSearch.Location = New-Object System.Drawing.Point(371, 7)
+$txtGridSearch.Location = New-Object System.Drawing.Point(517, 7)
 if ($Script:GridSearchText) { $txtGridSearch.Text = $Script:GridSearchText }
 $txtGridSearch.Add_KeyDown({
     param($s, $e)
@@ -1584,14 +1618,15 @@ $txtGridSearch.Add_KeyDown({
 $btnSearch = New-Object System.Windows.Forms.Button
 $btnSearch.Text = "Search"
 $btnSearch.Size = New-Object System.Drawing.Size(60, 26)
-$btnSearch.Location = New-Object System.Drawing.Point(516, 6)
+$btnSearch.Location = New-Object System.Drawing.Point(662, 6)
 $btnClearSearch = New-Object System.Windows.Forms.Button
 $btnClearSearch.Text = "Clear"
 $btnClearSearch.Size = New-Object System.Drawing.Size(55, 26)
-$btnClearSearch.Location = New-Object System.Drawing.Point(581, 6)
+$btnClearSearch.Location = New-Object System.Drawing.Point(727, 6)
 [void]$gridPanel.Controls.Add($btnSaveFromGrid)
 [void]$gridPanel.Controls.Add($btnExclusions)
 [void]$gridPanel.Controls.Add($btnRandomizeSelected)
+[void]$gridPanel.Controls.Add($btnApplyGeneralKeybinds)
 [void]$gridPanel.Controls.Add($lblSearch)
 [void]$gridPanel.Controls.Add($txtGridSearch)
 [void]$gridPanel.Controls.Add($btnSearch)
@@ -1849,6 +1884,14 @@ $btnRandomizeSelected.Add_Click({
     } else {
         $lblStatus.Text = "No rows randomized. Select one or more rows in the grid (skip rows that inherit key from General), then click Randomize selected."
     }
+})
+
+$btnApplyGeneralKeybinds.Add_Click({
+    $filter = Get-CurrentFilterSection -ComboFilter $comboFilter
+    Sync-GridToRows -Grid $dgv -Rows $Script:AllRows -FilterSection $filter
+    $n = Invoke-ApplyGeneralKeybindsToAllSections -Rows $Script:AllRows
+    Update-GridFromRows -Grid $dgv -Rows $Script:AllRows -FilterSection $Script:CurrentFilterSection -SearchText $Script:GridSearchText
+    $lblStatus.Text = "Applied General keybinds to $n row(s) in all specs."
 })
 
 $btnSearch.Add_Click({

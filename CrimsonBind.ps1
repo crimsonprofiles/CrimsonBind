@@ -57,7 +57,36 @@ $Script:ConfigIniKeyCodeMap = @{
     "A"="sc1e"; "B"="sc30"; "C"="sc2e"; "D"="sc20"; "E"="sc12"; "F"="sc21"; "G"="sc22"; "H"="sc23"; "I"="sc17"; "J"="sc24"; "K"="sc25"; "L"="sc26"; "M"="sc32"; "N"="sc31"; "O"="sc18"; "P"="sc19"; "Q"="sc10"; "R"="sc13"; "S"="sc1f"; "T"="sc14"; "U"="sc16"; "V"="sc2f"; "W"="sc11"; "X"="sc2d"; "Y"="sc15"; "Z"="sc2c"
     "LBRACKET"="vkdb"; "RBRACKET"="vkdd"; "BACKSLASH"="vkdc"; "SEMICOLON"="vkba"; "APOSTROPHE"="vkde"; "COMMA"="vkbc"; "PERIOD"="vkbe"; "SLASH"="vkbf"
     "NUMPAD0"="vk60"; "NUMPAD1"="sc4f"; "NUMPAD2"="sc50"; "NUMPAD3"="sc51"; "NUMPAD4"="vk64"; "NUMPAD5"="vk65"; "NUMPAD6"="vk66"; "NUMPAD7"="sc47"; "NUMPAD8"="vk68"; "NUMPAD9"="sc49"
+    "TAB"="sc0f"
 }
+# Reverse map: config.ini code (e.g. sc21, vk70) -> human key name (F, F1). Used by ConvertFrom-ConfigIniKey for export.
+$Script:ConfigIniCodeToKeyName = @{}
+foreach ($entry in $Script:ConfigIniKeyCodeMap.GetEnumerator()) { $Script:ConfigIniCodeToKeyName[$entry.Value] = $entry.Key }
+
+# Convert config.ini key (e.g. +sc21_67701769) to human CSV key (e.g. SHIFT-F). Returns original string if not recognized or suffix differs from expected (so we don't change keys we can't round-trip).
+function ConvertFrom-ConfigIniKey {
+    param([string]$ConfigKey)
+    $k = ($ConfigKey -replace "^\s+|\s+$", "")
+    if (-not $k) { return $k }
+    if ($k -notmatch '^([\^!+]*)(vk[0-9a-fA-F]+|sc[0-9a-fA-F]+)_([0-9a-fA-F]+)$') { return $k }
+    $suffix = $Matches[3]
+    if ($suffix -ne $Script:ConfigIniKeySuffix) { return $k }
+    $modPrefix = $Matches[1]
+    $code = $Matches[2].ToLowerInvariant()
+    $keyName = $Script:ConfigIniCodeToKeyName[$code]
+    if (-not $keyName -and $code.Length -gt 2) {
+        $prefix = $code.Substring(0, 2)
+        $hex = $code.Substring(2)
+        if ($hex.Length -eq 1 -and ($prefix -eq "vk" -or $prefix -eq "sc")) { $code = $prefix + "0" + $hex; $keyName = $Script:ConfigIniCodeToKeyName[$code] }
+    }
+    if (-not $keyName) { return $k }
+    $modStr = ""
+    if ($modPrefix -match '\^') { $modStr += "CTRL-" }
+    if ($modPrefix -match '!') { $modStr += "ALT-" }
+    if ($modPrefix -match '\+') { $modStr += "SHIFT-" }
+    return $modStr + $keyName
+}
+
 # Convert CSV key (e.g. F1, SHIFT-F1, ALT-K) to config.ini format (e.g. +vk70_67701769). Pass through if already in config format.
 function ConvertTo-ConfigIniKey {
     param([string]$Key, [string]$Suffix = $Script:ConfigIniKeySuffix)
@@ -80,6 +109,26 @@ function ConvertTo-ConfigIniKey {
     return $modStr + $code + "_" + $Suffix
 }
 
+# Section names in config.ini that are not keybind sections (export skips these).
+$Script:ConfigIniNonBindSections = @{ "Main" = $true; "SourceSettings" = $true; "PhysInput" = $true }
+
+# Regex: keybind value is optional modifiers then vk/sc + hex + _ + suffix. Used to exclude Main/SourceSettings/PhysInput rows even if section name matching fails.
+$Script:ConfigIniKeybindValuePattern = '^[\^!+]*(vk|sc)[0-9a-fA-F]+_[0-9a-fA-F]+$'
+
+# Action names that are universal (General-only); exclude from config.ini import so CSV General rows are preserved.
+$Script:ConfigIniExcludeActionNames = @{
+    "Human Racial" = $true; "Stoneform" = $true; "Shadowmeld" = $true; "Escape Artist" = $true
+    "Gift of the Naaru" = $true; "Darkflight" = $true; "Blood Fury" = $true; "Will of the Forsaken" = $true
+    "War Stomp" = $true; "Berserking" = $true; "Arcane Torrent" = $true; "Rocket Jump" = $true
+    "Rocket Barrage" = $true; "Quaking Palm" = $true; "Spatial Rift" = $true; "Light's Judgment" = $true
+    "Fireblood" = $true; "Arcane Pulse" = $true; "Bull Rush" = $true; "Ancestral Call" = $true
+    "Haymaker" = $true; "Regeneratin" = $true; "Bag of Tricks" = $true; "Hyper Organic Light Originator" = $true
+    "Azerite Surge" = $true; "Sharpen Blade" = $true
+}
+
+# Skip macro text that is template/description so we don't overwrite custom macros.
+$Script:ConfigIniDescriptionMacroPattern = '^For instructions on how to set up this hotkey'
+
 function Get-ConfigIniSectionsAndBinds {
     param([string]$ConfigPath)
     $out = [System.Collections.ArrayList]::new()
@@ -90,28 +139,35 @@ function Get-ConfigIniSectionsAndBinds {
     foreach ($line in $lines) {
         $strip = $line.Trim()
         if ($strip -match '^\[(.+)\]$') {
-            $currentSection = $Matches[1].Trim()
+            $raw = $Matches[1].Trim()
+            $currentSection = if ($raw.Length -gt 0 -and [int][char]$raw[0] -eq 0xFEFF) { $raw.Substring(1).Trim() } else { $raw }
             continue
         }
-        if ($null -ne $currentSection -and $strip -match '^([^=]+)=(.*)$') {
-            $actionName = $Matches[1].Trim()
-            $value = $Matches[2].Trim()
-            if (-not $actionName) { continue }
-            if ($actionName -match '^START\s') { continue }
-            $keyPart = $value
-            $afterSemi = ""
-            if ($value -match '^([^;]*);(.*)$') {
-                $keyPart = $Matches[1].Trim()
-                $afterSemi = $Matches[2].Trim()
-            }
-            [void]$out.Add([PSCustomObject]@{
-                Section    = $currentSection
-                ActionName = $actionName
-                Key        = $keyPart
-                MacroText  = $afterSemi
-                TextureID  = "132089"
-            })
+        if ($null -eq $currentSection) { continue }
+        if ($Script:ConfigIniNonBindSections.ContainsKey($currentSection)) { continue }
+        if ($strip -notmatch '^([^=]+)=(.*)$') { continue }
+        $actionName = $Matches[1].Trim()
+        $value = $Matches[2].Trim()
+        if (-not $actionName) { continue }
+        if ($actionName -match '^START') { continue }
+        if ($actionName -match '^Target Member\d+$') { continue }
+        if ($Script:ConfigIniExcludeActionNames.ContainsKey($actionName)) { continue }
+        if ($actionName -match '^Universal\d+ Unit\d+$') { continue }
+        $keyPart = $value
+        $afterSemi = ""
+        if ($value -match '^([^;]*);(.*)$') {
+            $keyPart = $Matches[1].Trim()
+            $afterSemi = $Matches[2].Trim()
         }
+        if ($afterSemi -and $afterSemi -match $Script:ConfigIniDescriptionMacroPattern) { continue }
+        if ($keyPart -and $keyPart -notmatch $Script:ConfigIniKeybindValuePattern -and -not $afterSemi) { continue }
+        [void]$out.Add([PSCustomObject]@{
+            Section    = $currentSection
+            ActionName = $actionName
+            Key        = $keyPart
+            MacroText  = $afterSemi
+            TextureID  = "132089"
+        })
     }
     return $out
 }
@@ -146,16 +202,48 @@ function Set-ConfigIniFromRows {
     $currentSection = $null
     $newLines = [System.Collections.ArrayList]::new()
     $replaced = 0
+    $added = 0
+    # Track which Section|Action we've output (replaced or passed through) so we can add missing CSV entries.
+    $writtenInSection = @{}
+
+    function Add-MissingKeysForSection {
+        param($section, $keyMap, [System.Collections.ArrayList]$targetNewLines)
+        $inTarget = -not $OnlySection -or ($section -eq $OnlySection)
+        if (-not $inTarget) { return 0 }
+        $count = 0
+        foreach ($mapKey in $keyMap.Keys) {
+            if ($mapKey -notmatch '^([^|]+)\|(.+)$') { continue }
+            $sec = $Matches[1]
+            $act = $Matches[2]
+            if ($sec -ne $section) { continue }
+            if ($writtenInSection[$section] -and $writtenInSection[$section][$act]) { continue }
+            $info = $keyMap[$mapKey]
+            $configKey = ConvertTo-ConfigIniKey -Key $info.Key -Suffix $Script:ConfigIniKeySuffix
+            $newVal = $configKey
+            if ($info.MacroText) { $newVal += "; $($info.MacroText)" }
+            [void]$targetNewLines.Add("$act=$newVal")
+            $count++
+        }
+        return $count
+    }
+
     foreach ($line in $lines) {
         $strip = $line.TrimEnd("`r", "`n")
         if ($strip -match '^\[(.+)\]$') {
-            $currentSection = $Matches[1].Trim()
+            $nextSection = $Matches[1].Trim()
+            # Before starting the new section, flush any CSV entries that were in keyMap for the previous section but missing from config.
+            if ($null -ne $currentSection) {
+                $n = Add-MissingKeysForSection -section $currentSection -keyMap $keyMap -targetNewLines $newLines
+                if ($n -gt 0) { $added += $n }
+            }
+            $currentSection = $nextSection
+            if (-not $writtenInSection[$currentSection]) { $writtenInSection[$currentSection] = @{} }
             [void]$newLines.Add($line)
             continue
         }
         if ($null -ne $currentSection -and $strip -match '^([^=]+)=(.*)$') {
             $actionName = $Matches[1].Trim()
-            $value = $Matches[2].Trim()
+            if ($actionName) { $writtenInSection[$currentSection][$actionName] = $true }
             $key = "$currentSection|$actionName"
             $inTargetSection = -not $OnlySection -or ($currentSection -eq $OnlySection)
             if ($inTargetSection -and $actionName -and $keyMap.ContainsKey($key)) {
@@ -168,9 +256,102 @@ function Set-ConfigIniFromRows {
             } else { [void]$newLines.Add($line) }
         } else { [void]$newLines.Add($line) }
     }
+    # Flush missing for the last section
+    if ($null -ne $currentSection) {
+        $n = Add-MissingKeysForSection -section $currentSection -keyMap $keyMap -targetNewLines $newLines
+        if ($n -gt 0) { $added += $n }
+    }
+
+    # Add sections that exist in CSV/keyMap but not in config.ini (so e.g. Hammer of Wrath gets written)
+    $sectionsInKeyMap = @{}
+    foreach ($mapKey in $keyMap.Keys) {
+        if ($mapKey -match '^([^|]+)\|') { $sectionsInKeyMap[$Matches[1]] = $true }
+    }
+    foreach ($sec in $sectionsInKeyMap.Keys) {
+        if ($writtenInSection.ContainsKey($sec)) { continue }
+        if ($OnlySection -and $sec -ne $OnlySection) { continue }
+        [void]$newLines.Add("")
+        [void]$newLines.Add("[$sec]")
+        $n = Add-MissingKeysForSection -section $sec -keyMap $keyMap -targetNewLines $newLines
+        if ($n -gt 0) { $added += $n }
+    }
+
     $outText = ($newLines -join "`r`n") + "`r`n"
     [System.IO.File]::WriteAllText($ConfigPath, $outText, [System.Text.Encoding]::Unicode)
-    return $replaced
+    return ($replaced + $added)
+}
+
+# After writing config.ini, validate that binds match. Returns hashtable: Match, Mismatch, Skipped, NoKeyInCsv, TotalInScope, DuplicateKeyInSection.
+function Get-ConfigIniUpdateValidation {
+    param([string]$ConfigPath, [System.Collections.ArrayList]$Rows, [string]$OnlySection = $null)
+    $result = @{ Match = 0; Mismatch = 0; Skipped = 0; NoKeyInCsv = 0; TotalInScope = 0; MismatchDetails = [System.Collections.ArrayList]::new(); DuplicateKeyInSection = [System.Collections.ArrayList]::new() }
+    if (-not (Test-Path -LiteralPath $ConfigPath -PathType Leaf)) { return $result }
+    $generalByActionName = @{}
+    foreach ($r in $Rows) {
+        if ($r.Section -eq "General") { $generalByActionName[$r.ActionName] = [PSCustomObject]@{ Key = $r.Key; MacroText = $r.MacroText } }
+    }
+    $keyMap = @{}
+    foreach ($r in $Rows) {
+        $k = "$($r.Section)|$($r.ActionName)"
+        if ($r.Section -eq "General") {
+            $keyMap[$k] = [PSCustomObject]@{ Key = $r.Key; MacroText = $r.MacroText }
+        } elseif ($generalByActionName.ContainsKey($r.ActionName)) {
+            $keyMap[$k] = $generalByActionName[$r.ActionName]
+        } else {
+            $keyMap[$k] = [PSCustomObject]@{ Key = $r.Key; MacroText = $r.MacroText }
+        }
+    }
+    if ($OnlySection -and $OnlySection -ne "General") {
+        foreach ($actionName in $generalByActionName.Keys) {
+            $keyMap["$OnlySection|$actionName"] = $generalByActionName[$actionName]
+        }
+    }
+    $configRows = Get-ConfigIniSectionsAndBinds -ConfigPath $ConfigPath
+    $actualByKey = @{}
+    foreach ($c in $configRows) { $actualByKey["$($c.Section)|$($c.ActionName)"] = $c }
+    foreach ($r in $Rows) {
+        $inScope = -not $OnlySection -or ($r.Section -eq $OnlySection)
+        if (-not $inScope) { continue }
+        $result.TotalInScope++
+        $key = "$($r.Section)|$($r.ActionName)"
+        if (-not $keyMap.ContainsKey($key)) { continue }
+        $info = $keyMap[$key]
+        if (-not $info.Key -or ($info.Key -eq "")) { $result.NoKeyInCsv++; continue }
+        $expectedConfigKey = ConvertTo-ConfigIniKey -Key $info.Key -Suffix $Script:ConfigIniKeySuffix
+        $expectedMacro = if ($info.MacroText) { $info.MacroText.Trim() } else { "" }
+        if (-not $actualByKey.ContainsKey($key)) { $result.Skipped++; continue }
+        $actual = $actualByKey[$key]
+        $actualKey = if ($actual.Key) { $actual.Key.Trim() } else { "" }
+        $actualMacro = if ($actual.MacroText) { $actual.MacroText.Trim() } else { "" }
+        if ($actualKey -eq $expectedConfigKey -and $actualMacro -eq $expectedMacro) { $result.Match++ }
+        else {
+            $result.Mismatch++
+            [void]$result.MismatchDetails.Add("$($r.Section) | $($r.ActionName): key or macro differs")
+        }
+    }
+    # Detect duplicate key in same section (only one action can have the key in-game; report so user can change one in CSV)
+    $bySectionAndKey = @{}
+    foreach ($mapKey in $keyMap.Keys) {
+        if ($mapKey -notmatch '^([^|]+)\|(.+)$') { continue }
+        $sec = $Matches[1]; $act = $Matches[2]
+        if ($OnlySection -and $sec -ne $OnlySection) { continue }
+        $info = $keyMap[$mapKey]
+        if (-not $info.Key -or ($info.Key -eq "")) { continue }
+        $configKey = ConvertTo-ConfigIniKey -Key $info.Key -Suffix $Script:ConfigIniKeySuffix
+        $k = "$sec|$configKey"
+        if (-not $bySectionAndKey[$k]) { $bySectionAndKey[$k] = [System.Collections.ArrayList]::new() }
+        [void]$bySectionAndKey[$k].Add($act)
+    }
+    foreach ($k in $bySectionAndKey.Keys) {
+        $list = $bySectionAndKey[$k]
+        if ($list.Count -gt 1) {
+            $parts = $k -split '\|', 2
+            $sec = $parts[0]
+            $csvKey = $keyMap["$sec|$($list[0])"].Key
+            [void]$result.DuplicateKeyInSection.Add("$sec`: $csvKey -> $($list -join ', ')")
+        }
+    }
+    return $result
 }
 
 # ---------- CSV ----------
@@ -205,6 +386,7 @@ function Import-CsvToRows {
         $mac = if ($mac) { $mac.ToString().Trim() } else { "" }
         $tex = if ($tex) { $tex.ToString().Trim() } else { "132089" }
         if ($sec -and $act) {
+            if ($key) { $key = ConvertFrom-ConfigIniKey -ConfigKey $key }
             [void]$rows.Add([PSCustomObject]@{ Section = $sec; ActionName = $act; MacroText = $mac; Key = $key; TextureID = $tex })
         }
     }
@@ -217,7 +399,7 @@ $Script:KeyPool = @(
     "R","T","Y","U","I","O","P","LBRACKET","RBRACKET","BACKSLASH",
     "F","G","H","J","K","L","SEMICOLON","APOSTROPHE",
     "Z","X","C","V","B","N","M","COMMA","PERIOD","SLASH",
-    "A","S","D","E","W","Q"
+    "A","S","D","E","W","Q","TAB"
 )
 $Script:Mods = @("CTRL-","ALT-","SHIFT-","CTRL-ALT-","CTRL-SHIFT-","ALT-SHIFT-","CTRL-ALT-SHIFT-")
 
@@ -257,11 +439,38 @@ function Get-FullKeyPoolForRandomize {
 }
 
 function Invoke-RandomizeKeys {
-    param([System.Collections.ArrayList]$Rows)
+    param([System.Collections.ArrayList]$Rows, [string]$OnlySection = $null)
     $fullPool = Get-FullKeyPoolForRandomize
     $rng = [System.Random]::new()
-    $shuffled = [System.Collections.ArrayList]::new()
-    foreach ($k in ($fullPool | Sort-Object { $rng.Next() })) { [void]$shuffled.Add($k) }
+
+    # Keys currently used in General (so we don't assign them to specs when randomizing)
+    $generalKeys = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($r in $Rows) {
+        if ($r.Section -eq "General") {
+            $k = if ($r.Key) { $r.Key.ToString().Trim() } else { "" }
+            if ($k) { [void]$generalKeys.Add($k) }
+        }
+    }
+    $poolWithoutGeneral = [System.Collections.ArrayList]::new()
+    foreach ($k in $fullPool) {
+        if (-not $generalKeys.Contains($k)) { [void]$poolWithoutGeneral.Add($k) }
+    }
+
+    if ($OnlySection) {
+        # Randomize only the selected section; unique keys within section and do not use keys bound in General
+        $targetRows = [System.Collections.ArrayList]::new()
+        foreach ($r in $Rows) { if ($r.Section -eq $OnlySection) { [void]$targetRows.Add($r) } }
+        $pool = if ($OnlySection -eq "General") { $fullPool } else { $poolWithoutGeneral }
+        $shuffled = [System.Collections.ArrayList]::new()
+        foreach ($k in ($pool | Sort-Object { $rng.Next() })) { [void]$shuffled.Add($k) }
+        $assignCount = [Math]::Min($shuffled.Count, $targetRows.Count)
+        for ($i = 0; $i -lt $assignCount; $i++) {
+            $targetRows[$i].Key = $shuffled[$i]
+        }
+        return
+    }
+
+    # Randomize all sections: General first from full pool; each spec from pool minus General's keys (no duplicates within any section)
     $generalList = [System.Collections.ArrayList]::new()
     $bySection = @{}
     foreach ($r in $Rows) {
@@ -271,17 +480,103 @@ function Invoke-RandomizeKeys {
             [void]$bySection[$r.Section].Add($r)
         }
     }
-    $idx = 0
+    $assignSection = {
+        param([System.Collections.ArrayList]$sectionRows, [System.Collections.ArrayList]$pool)
+        $shuffled = [System.Collections.ArrayList]::new()
+        foreach ($k in ($pool | Sort-Object { $rng.Next() })) { [void]$shuffled.Add($k) }
+        $n = [Math]::Min($shuffled.Count, $sectionRows.Count)
+        for ($i = 0; $i -lt $n; $i++) { $sectionRows[$i].Key = $shuffled[$i] }
+    }
+    $assignSection.Invoke($generalList, $fullPool) | Out-Null
+    # Rebuild pool excluding General's newly assigned keys so specs don't reuse them
+    $generalKeys.Clear()
     foreach ($r in $generalList) {
-        if ($idx -ge $shuffled.Count) { break }
-        $r.Key = $shuffled[$idx]; $idx++
+        $k = if ($r.Key) { $r.Key.ToString().Trim() } else { "" }
+        if ($k) { [void]$generalKeys.Add($k) }
+    }
+    $poolWithoutGeneral = [System.Collections.ArrayList]::new()
+    foreach ($k in $fullPool) {
+        if (-not $generalKeys.Contains($k)) { [void]$poolWithoutGeneral.Add($k) }
     }
     foreach ($sec in $bySection.Keys) {
-        foreach ($r in $bySection[$sec]) {
-            if ($idx -ge $shuffled.Count) { $idx = 0 }
-            $r.Key = $shuffled[$idx]; $idx++
+        $assignSection.Invoke($bySection[$sec], $poolWithoutGeneral) | Out-Null
+    }
+}
+
+# Randomize only the currently selected grid rows: assign each to an unassigned key (no duplicate within section, exclude General keys for specs).
+function Invoke-RandomizeSelectedGridRows {
+    param($Grid, [System.Collections.ArrayList]$Rows, [string]$FilterSection)
+    if (-not $Rows -or $Rows.Count -eq 0) { return 0 }
+    $selected = @($Grid.SelectedRows)
+    if ($selected.Count -eq 0) { return 0 }
+    $generalActionNames = @{}
+    $generalKeys = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($r in $Rows) {
+        if ($r.Section -eq "General") {
+            $generalActionNames[$r.ActionName] = $true
+            $k = if ($r.Key) { $r.Key.ToString().Trim() } else { "" }
+            if ($k) { [void]$generalKeys.Add($k) }
         }
     }
+    $selectedPairs = [System.Collections.ArrayList]::new()
+    foreach ($row in $selected) {
+        $sec = $row.Cells["Section"].Value; $act = $row.Cells["Action"].Value
+        $secStr = if ($null -ne $sec) { $sec.ToString().Trim() } else { "" }
+        $actStr = if ($null -ne $act) { $act.ToString().Trim() } else { "" }
+        if (-not $secStr -or -not $actStr) { continue }
+        if ($secStr -ne "General" -and $generalActionNames.ContainsKey($actStr)) { continue }
+        [void]$selectedPairs.Add([PSCustomObject]@{ Section = $secStr; ActionName = $actStr })
+    }
+    if ($selectedPairs.Count -eq 0) { return 0 }
+    $fullPool = Get-FullKeyPoolForRandomize
+    $poolWithoutGeneral = [System.Collections.ArrayList]::new()
+    foreach ($k in $fullPool) {
+        if (-not $generalKeys.Contains($k)) { [void]$poolWithoutGeneral.Add($k) }
+    }
+    $rng = [System.Random]::new()
+    $selectedSet = @{}
+    foreach ($p in $selectedPairs) { $selectedSet["$($p.Section)|$($p.ActionName)"] = $true }
+    $usedBySection = @{}
+    foreach ($r in $Rows) {
+        $key = "$($r.Section)|$($r.ActionName)"
+        if ($selectedSet[$key]) { continue }
+        $k = if ($r.Key) { $r.Key.ToString().Trim() } else { "" }
+        if (-not $k) { continue }
+        $sec = $r.Section
+        if (-not $usedBySection[$sec]) { $usedBySection[$sec] = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase) }
+        [void]$usedBySection[$sec].Add($k)
+    }
+    $bySection = @{}
+    foreach ($p in $selectedPairs) {
+        $sec = $p.Section
+        if (-not $bySection[$sec]) { $bySection[$sec] = [System.Collections.ArrayList]::new() }
+        [void]$bySection[$sec].Add($p)
+    }
+    $assigned = 0
+    foreach ($sec in $bySection.Keys) {
+        $used = $usedBySection[$sec]
+        $pool = [System.Collections.ArrayList]::new()
+        $sourcePool = if ($sec -eq "General") { $fullPool } else { $poolWithoutGeneral }
+        foreach ($k in $sourcePool) {
+            if (-not $used -or -not $used.Contains($k)) { [void]$pool.Add($k) }
+        }
+        $list = $bySection[$sec]
+        $shuffled = [System.Collections.ArrayList]::new()
+        foreach ($k in ($pool | Sort-Object { $rng.Next() })) { [void]$shuffled.Add($k) }
+        $n = [Math]::Min($shuffled.Count, $list.Count)
+        for ($i = 0; $i -lt $n; $i++) {
+            $p = $list[$i]
+            $newKey = $shuffled[$i]
+            foreach ($r in $Rows) {
+                if ($r.Section -eq $p.Section -and $r.ActionName -eq $p.ActionName) {
+                    $r.Key = $newKey
+                    $assigned++
+                    break
+                }
+            }
+        }
+    }
+    return $assigned
 }
 
 # ---------- Lua helpers (Get-LuaEscaped used by Debounce export) ----------
@@ -406,7 +701,7 @@ function Get-SavedVariablesDir {
 }
 
 function New-CrimsonBackup {
-    param([string]$ConfigPath, [string]$WtfDir, [string]$AccountName)
+    param([string]$ConfigPath, [string]$WtfDir, [string]$AccountName, [string]$CsvPath)
     if (-not $ConfigPath -or -not (Test-Path -LiteralPath $ConfigPath -PathType Leaf)) { return $null }
     if (-not (Test-Path -LiteralPath $Script:BackupRoot -PathType Container)) {
         New-Item -ItemType Directory -Path $Script:BackupRoot -Force | Out-Null
@@ -427,6 +722,11 @@ function New-CrimsonBackup {
                 }
             }
         }
+    }
+    if ($CsvPath -and (Test-Path -LiteralPath $CsvPath -PathType Leaf)) {
+        $csvName = [System.IO.Path]::GetFileName($CsvPath)
+        Copy-Item -LiteralPath $CsvPath -Destination (Join-Path $destDir $csvName) -Force
+        $count++
     }
     return @{ Path = $destDir; FileCount = $count }
 }
@@ -550,14 +850,15 @@ function Find-DebounceKeyValue {
     return @{ KeyStart = $m.Index; ValueStart = $valueStart; ValueLength = $valueLen }
 }
 
-# Build Lua for one bind entry (macrotext with name, value, icon, key).
+# Build Lua for one bind entry (macrotext with name, value, icon, key). Key is normalized to config.ini format (+sc21_67701769) so Debounce receives same format as config.ini.
 function Get-DebounceBindLua {
     param($Row)
     $name = Get-LuaEscaped -s $Row.ActionName
     $value = Get-LuaEscaped -s $Row.MacroText
     $icon = 132089
     if ($Row.TextureID -match '^\d+$') { $icon = [int]$Row.TextureID }
-    $key = Get-LuaEscaped -s $Row.Key
+    $configKey = ConvertTo-ConfigIniKey -Key $Row.Key -Suffix $Script:ConfigIniKeySuffix
+    $key = Get-LuaEscaped -s $configKey
     $lines = @(
         "{",
         "[""type""] = ""macrotext"",",
@@ -743,9 +1044,34 @@ function Export-DebounceFromRows {
 }
 
 # ---------- GUI ----------
+# Returns hashtable of "Section|Key" -> $true for keys that appear more than once in that section (empty keys ignored).
+# Rows that inherit key from General (e.g. Target Member1-40 in a spec) are excluded so they don't trigger duplicate highlight.
+function Get-DuplicateKeysBySection {
+    param([System.Collections.ArrayList]$Rows)
+    $generalActionNames = @{}
+    foreach ($r in $Rows) {
+        if ($r.Section -eq "General") { $generalActionNames[$r.ActionName] = $true }
+    }
+    $bySectionKey = @{}
+    foreach ($r in $Rows) {
+        if ($r.Section -ne "General" -and $generalActionNames.ContainsKey($r.ActionName)) { continue }
+        $k = if ($r.Key) { $r.Key.ToString().Trim() } else { "" }
+        if (-not $k) { continue }
+        $sec = if ($r.Section) { $r.Section.ToString().Trim() } else { "" }
+        if (-not $sec) { continue }
+        $key = "$sec|$k"
+        if (-not $bySectionKey[$key]) { $bySectionKey[$key] = 0 }
+        $bySectionKey[$key]++
+    }
+    $duplicateSet = @{}
+    foreach ($key in $bySectionKey.Keys) { if ($bySectionKey[$key] -gt 1) { $duplicateSet[$key] = $true } }
+    return $duplicateSet
+}
+
 function Update-GridFromRows {
     param($Grid, [System.Collections.ArrayList]$Rows, [string]$FilterSection, [string]$SearchText)
     if ($null -eq $SearchText -and $Script:GridSearchText) { $SearchText = $Script:GridSearchText }
+    $duplicateSet = Get-DuplicateKeysBySection -Rows $Rows
     $keyList = [System.Collections.ArrayList]::new()
     foreach ($k in (Get-FullKeyPool)) { [void]$keyList.Add($k) }
     # Include F1–F12 and common modifier combos so General target binds (F12, SHIFT-F12, CTRL-F12, etc.) always appear in the Key dropdown
@@ -761,6 +1087,7 @@ function Update-GridFromRows {
         if ($k -and $keyList -notcontains $k) { [void]$keyList.Add($k) }
     }
     $keyList.Sort()
+    [void]$keyList.Insert(0, "")   # blank option at top to clear the key
     $keyCol = $Grid.Columns["Key"]
     if ($keyCol -and $keyCol -is [System.Windows.Forms.DataGridViewComboBoxColumn]) {
         $keyCol.DataSource = $null
@@ -768,22 +1095,46 @@ function Update-GridFromRows {
     }
     $Grid.Rows.Clear()
     $generalActionNames = @{}
+    $generalByActionName = @{}
     if ($FilterSection -and $FilterSection -ne "General") {
-        foreach ($r in $Rows) { if ($r.Section -eq "General") { $generalActionNames[$r.ActionName] = $true } }
+        foreach ($r in $Rows) {
+            if ($r.Section -eq "General") {
+                $generalActionNames[$r.ActionName] = $true
+                $generalByActionName[$r.ActionName] = [PSCustomObject]@{ Key = $r.Key; MacroText = $r.MacroText }
+            }
+        }
     }
     $search = if ($SearchText) { $SearchText.Trim() } else { "" }
     foreach ($r in $Rows) {
         if ($FilterSection -and $r.Section -ne $FilterSection) { continue }
-        if ($FilterSection -and $FilterSection -ne "General" -and $generalActionNames.ContainsKey($r.ActionName)) { continue }
+        $useGeneral = $FilterSection -and $FilterSection -ne "General" -and $generalByActionName.ContainsKey($r.ActionName)
+        if ($useGeneral) {
+            $g = $generalByActionName[$r.ActionName]
+            $dispKey = if ($g.Key) { $g.Key } else { "" }
+            $dispMacro = if ($g.MacroText) { $g.MacroText } else { "" }
+        } else {
+            $dispKey = $r.Key; $dispMacro = $r.MacroText
+        }
         if ($search) {
             $s = if ($r.Section) { $r.Section } else { "" }
             $a = if ($r.ActionName) { $r.ActionName } else { "" }
-            $k = if ($r.Key) { $r.Key } else { "" }
-            $m = if ($r.MacroText) { $r.MacroText } else { "" }
-            $combined = "$s $a $k $m".ToUpperInvariant()
+            $combined = "$s $a $dispKey $dispMacro".ToUpperInvariant()
             if ($combined.IndexOf($search.ToUpperInvariant()) -lt 0) { continue }
         }
-        [void]$Grid.Rows.Add($r.Section, $r.ActionName, $r.Key, $r.MacroText)
+        [void]$Grid.Rows.Add($r.Section, $r.ActionName, $dispKey, $dispMacro)
+    }
+    # Highlight Key cell when duplicate within same section (red tint); General and cross-spec same key are not highlighted
+    $normalBack = [System.Drawing.Color]::White
+    $duplicateBack = [System.Drawing.Color]::FromArgb(255, 220, 220)
+    foreach ($row in $Grid.Rows) {
+        $sec = $row.Cells["Section"].Value; $keyVal = $row.Cells["Key"].Value
+        $secStr = if ($null -ne $sec) { $sec.ToString().Trim() } else { "" }
+        $keyStr = if ($null -ne $keyVal -and ($keyVal.ToString().Trim())) { $keyVal.ToString().Trim() } else { "" }
+        if ($keyStr -and $duplicateSet["$secStr|$keyStr"]) {
+            $row.Cells["Key"].Style.BackColor = $duplicateBack
+        } else {
+            $row.Cells["Key"].Style.BackColor = $normalBack
+        }
     }
     $Script:CurrentFilterSection = $FilterSection
 }
@@ -797,8 +1148,8 @@ function Sync-GridToRows {
     $key = 0
     foreach ($r in $Rows) {
         if ($FilterSection -and $r.Section -ne $FilterSection) { continue }
-        if ($FilterSection -and $FilterSection -ne "General" -and $generalActionNames.ContainsKey($r.ActionName)) { continue }
-        if ($key -lt $Grid.Rows.Count) {
+        $isGeneralAction = $FilterSection -and $FilterSection -ne "General" -and $generalActionNames.ContainsKey($r.ActionName)
+        if ($key -lt $Grid.Rows.Count -and -not $isGeneralAction) {
             $cellKey = $Grid.Rows[$key].Cells["Key"].Value
             $cellMac = $Grid.Rows[$key].Cells["MacroText"].Value
             $r.Key = if ($null -ne $cellKey) { $cellKey.ToString().Trim() } else { "" }
@@ -813,6 +1164,59 @@ function Get-CurrentFilterSection {
     param([System.Windows.Forms.ComboBox]$ComboFilter)
     if (-not $ComboFilter -or -not $ComboFilter.SelectedItem -or $ComboFilter.SelectedItem -eq "(All sections)") { return $null }
     return $ComboFilter.SelectedItem
+}
+
+function Show-DuplicateKeysPopup {
+    param([System.Collections.ArrayList]$DuplicateList, [System.Windows.Forms.Form]$Owner = $null)
+    if (-not $DuplicateList -or $DuplicateList.Count -eq 0) { return }
+    $dupForm = New-Object System.Windows.Forms.Form
+    $dupForm.Text = "Duplicate keys in same section"
+    $dupForm.Size = New-Object System.Drawing.Size(600, 440)
+    $dupForm.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterParent
+    if ($Owner) { $dupForm.Owner = $Owner }
+    $dupForm.Font = New-Object System.Drawing.Font("Segoe UI", 9)
+    $y = [int]10
+    $lbl1 = New-Object System.Windows.Forms.Label
+    $lbl1.Text = "What is a duplicate? One key (e.g. CTRL-K) is bound to two or more different actions. In-game only one of them will respond to that key."
+    $lbl1.AutoSize = $true
+    $lbl1.Location = New-Object System.Drawing.Point(12, $y)
+    $lbl1.MaximumSize = New-Object System.Drawing.Size(560, 0)
+    [void]$dupForm.Controls.Add($lbl1)
+    $y += 28
+    $lbl2 = New-Object System.Windows.Forms.Label
+    $lbl2.Text = "How to fix: In the grid, find each action after the arrow and give one of them a different key so that key is used by only one action."
+    $lbl2.AutoSize = $true
+    $lbl2.Location = New-Object System.Drawing.Point(12, $y)
+    $lbl2.MaximumSize = New-Object System.Drawing.Size(560, 0)
+    [void]$dupForm.Controls.Add($lbl2)
+    $y += 28
+    $lbl3 = New-Object System.Windows.Forms.Label
+    $lbl3.Text = "List (Section: Key → Action1, Action2, ...):"
+    $lbl3.AutoSize = $true
+    $lbl3.Location = New-Object System.Drawing.Point(12, $y)
+    [void]$dupForm.Controls.Add($lbl3)
+    $y += 22
+    $lb = New-Object System.Windows.Forms.ListBox
+    $lb.Location = New-Object System.Drawing.Point(12, $y)
+    $lb.Size = New-Object System.Drawing.Size(560, 260)
+    $lb.Font = New-Object System.Drawing.Font("Consolas", 9)
+    foreach ($line in $DuplicateList) {
+        [void]$lb.Items.Add($line)
+    }
+    [void]$dupForm.Controls.Add($lb)
+    $lblCount = New-Object System.Windows.Forms.Label
+    $lblCount.Text = "Total: $($DuplicateList.Count) duplicate key(s) in this section."
+    $lblCount.AutoSize = $true
+    $lblCount.Location = New-Object System.Drawing.Point(12, 354)
+    [void]$dupForm.Controls.Add($lblCount)
+    $btnOk = New-Object System.Windows.Forms.Button
+    $btnOk.Text = "OK"
+    $btnOk.Size = New-Object System.Drawing.Size(80, 26)
+    $btnOk.Location = New-Object System.Drawing.Point(492, 350)
+    $btnOk.Add_Click({ $dupForm.Close() })
+    [void]$dupForm.Controls.Add($btnOk)
+    $dupForm.AcceptButton = $btnOk
+    $dupForm.ShowDialog() | Out-Null
 }
 
 function Update-SectionFilterCombo {
@@ -1126,6 +1530,25 @@ $dgv.Add_DataError({
     param($sender, $e)
     if ($e.ColumnIndex -ge 0 -and $sender.Columns[$e.ColumnIndex].Name -eq "Key") { $e.ThrowException = $false }
 })
+$dgv.Add_CellValueChanged({
+    param($s, $e)
+    if (-not $Script:AllRows -or $e.ColumnIndex -lt 0) { return }
+    if ($s.Columns[$e.ColumnIndex].Name -ne "Key" -and $s.Columns[$e.ColumnIndex].Name -ne "MacroText") { return }
+    Sync-GridToRows -Grid $s -Rows $Script:AllRows -FilterSection $Script:CurrentFilterSection
+    $duplicateSet = Get-DuplicateKeysBySection -Rows $Script:AllRows
+    $normalBack = [System.Drawing.Color]::White
+    $duplicateBack = [System.Drawing.Color]::FromArgb(255, 220, 220)
+    foreach ($row in $s.Rows) {
+        $sec = $row.Cells["Section"].Value; $keyVal = $row.Cells["Key"].Value
+        $secStr = if ($null -ne $sec) { $sec.ToString().Trim() } else { "" }
+        $keyStr = if ($null -ne $keyVal -and ($keyVal.ToString().Trim())) { $keyVal.ToString().Trim() } else { "" }
+        if ($keyStr -and $duplicateSet["$secStr|$keyStr"]) {
+            $row.Cells["Key"].Style.BackColor = $duplicateBack
+        } else {
+            $row.Cells["Key"].Style.BackColor = $normalBack
+        }
+    }
+})
 $gridPanel = New-Object System.Windows.Forms.Panel
 $gridPanel.Dock = "Bottom"
 $gridPanel.Height = 40
@@ -1138,13 +1561,17 @@ $btnExclusions = New-Object System.Windows.Forms.Button
 $btnExclusions.Text = "Exclusions"
 $btnExclusions.Size = New-Object System.Drawing.Size(90, 26)
 $btnExclusions.Location = New-Object System.Drawing.Point(114, 6)
+$btnRandomizeSelected = New-Object System.Windows.Forms.Button
+$btnRandomizeSelected.Text = "Randomize selected"
+$btnRandomizeSelected.Size = New-Object System.Drawing.Size(110, 26)
+$btnRandomizeSelected.Location = New-Object System.Drawing.Point(210, 6)
 $lblSearch = New-Object System.Windows.Forms.Label
 $lblSearch.Text = "Search:"
 $lblSearch.AutoSize = $true
-$lblSearch.Location = New-Object System.Drawing.Point(210, 10)
+$lblSearch.Location = New-Object System.Drawing.Point(326, 10)
 $txtGridSearch = New-Object System.Windows.Forms.TextBox
 $txtGridSearch.Size = New-Object System.Drawing.Size(140, 22)
-$txtGridSearch.Location = New-Object System.Drawing.Point(255, 7)
+$txtGridSearch.Location = New-Object System.Drawing.Point(371, 7)
 if ($Script:GridSearchText) { $txtGridSearch.Text = $Script:GridSearchText }
 $txtGridSearch.Add_KeyDown({
     param($s, $e)
@@ -1157,13 +1584,14 @@ $txtGridSearch.Add_KeyDown({
 $btnSearch = New-Object System.Windows.Forms.Button
 $btnSearch.Text = "Search"
 $btnSearch.Size = New-Object System.Drawing.Size(60, 26)
-$btnSearch.Location = New-Object System.Drawing.Point(400, 6)
+$btnSearch.Location = New-Object System.Drawing.Point(516, 6)
 $btnClearSearch = New-Object System.Windows.Forms.Button
 $btnClearSearch.Text = "Clear"
 $btnClearSearch.Size = New-Object System.Drawing.Size(55, 26)
-$btnClearSearch.Location = New-Object System.Drawing.Point(465, 6)
+$btnClearSearch.Location = New-Object System.Drawing.Point(581, 6)
 [void]$gridPanel.Controls.Add($btnSaveFromGrid)
 [void]$gridPanel.Controls.Add($btnExclusions)
+[void]$gridPanel.Controls.Add($btnRandomizeSelected)
 [void]$gridPanel.Controls.Add($lblSearch)
 [void]$gridPanel.Controls.Add($txtGridSearch)
 [void]$gridPanel.Controls.Add($btnSearch)
@@ -1225,6 +1653,31 @@ $btnExportConfig.Add_Click({
     if (-not $outPath) { $outPath = Join-Path $ToolDir "binds_export.csv" }
     try {
         $rows = Get-ConfigIniSectionsAndBinds -ConfigPath $Script:ConfigPath
+        # Reverse-translate config.ini key format (+sc21_67701769) to human CSV keys (e.g. SHIFT-F) for editing; Update config/Debounce will translate back.
+        foreach ($r in $rows) {
+            if ($r.Key) { $r.Key = ConvertFrom-ConfigIniKey -ConfigKey $r.Key }
+        }
+        if ($Script:AllRows -and $Script:AllRows.Count -gt 0 -and $Script:CsvPath) {
+            $existingByKey = @{}
+            foreach ($r in $Script:AllRows) { $existingByKey["$($r.Section)|$($r.ActionName)"] = $r }
+            $parsedByKey = @{}
+            foreach ($r in $rows) { $parsedByKey["$($r.Section)|$($r.ActionName)"] = $r }
+            $merged = [System.Collections.ArrayList]::new()
+            foreach ($r in $Script:AllRows) {
+                $k = "$($r.Section)|$($r.ActionName)"
+                if ($parsedByKey.ContainsKey($k)) { [void]$merged.Add($parsedByKey[$k]) } else { [void]$merged.Add($r) }
+            }
+            foreach ($r in $rows) {
+                $k = "$($r.Section)|$($r.ActionName)"
+                if (-not $existingByKey.ContainsKey($k)) { [void]$merged.Add($r) }
+            }
+            $rows = $merged
+            $filtered = [System.Collections.ArrayList]::new()
+            foreach ($r in $rows) {
+                if ($r.Section -eq "General" -or $r.ActionName -notmatch '^Target Member\d+$') { [void]$filtered.Add($r) }
+            }
+            $rows = $filtered
+        }
         Export-RowsToCsv -Path $outPath -Rows $rows
         $Script:AllRows = $rows
         $Script:CsvPath = $outPath
@@ -1255,9 +1708,10 @@ $btnLoadCsv.Add_Click({
 $btnRandomize.Add_Click({
     $filter = Get-CurrentFilterSection -ComboFilter $comboFilter
     Sync-GridToRows -Grid $dgv -Rows $Script:AllRows -FilterSection $filter
-    Invoke-RandomizeKeys -Rows $Script:AllRows
+    Invoke-RandomizeKeys -Rows $Script:AllRows -OnlySection $filter
     Update-GridFromRows -Grid $dgv -Rows $Script:AllRows -FilterSection $filter
-    $lblStatus.Text = "Randomized keys. Click Update config.ini or Update Debounce to write files."
+    $scope = if ($filter) { " for section: $filter" } else { "" }
+    $lblStatus.Text = "Randomized keys$scope. Click Update config.ini or Update Debounce to write files."
 })
 
 $btnUpdateConfig.Add_Click({
@@ -1266,7 +1720,23 @@ $btnUpdateConfig.Add_Click({
     if (-not $Script:ConfigPath -or -not (Test-Path -LiteralPath $Script:ConfigPath -PathType Leaf)) { $lblStatus.Text = "Select config.ini first."; return }
     try {
         $n = Set-ConfigIniFromRows -ConfigPath $Script:ConfigPath -Rows $Script:AllRows -OnlySection $filter
-        if ($filter) { $lblStatus.Text = "Updated $n keybinds in config.ini (section: $filter)." } else { $lblStatus.Text = "Updated $n keybinds in config.ini." }
+        $val = Get-ConfigIniUpdateValidation -ConfigPath $Script:ConfigPath -Rows $Script:AllRows -OnlySection $filter
+        $scope = if ($filter) { " (section: $filter)" } else { "" }
+        $msg = "Updated $n keybinds in config.ini$scope. Validation: $($val.Match) match"
+        if ($val.Match -gt $n) { $msg += " ($($val.Match - $n) already correct)" }
+        if ($val.Mismatch -gt 0) { $msg += ", $($val.Mismatch) mismatch" }
+        if ($val.Skipped -gt 0) { $msg += ", $($val.Skipped) skipped (not in config)" }
+        if ($val.NoKeyInCsv -gt 0) { $msg += ", $($val.NoKeyInCsv) empty keybind in CSV" }
+        $msg += "."
+        if ($val.DuplicateKeyInSection -and $val.DuplicateKeyInSection.Count -gt 0) {
+            $msg += " Duplicate key in same section (only one action gets the key): $($val.DuplicateKeyInSection.Count). Change one in CSV to fix."
+            Write-CrimsonBindLog -Message "Duplicate key in section: $($val.DuplicateKeyInSection -join '; ')" -Level "Warning"
+            Show-DuplicateKeysPopup -DuplicateList $val.DuplicateKeyInSection -Owner $form
+        }
+        $lblStatus.Text = $msg
+        if ($val.Mismatch -gt 0 -and $val.MismatchDetails.Count -gt 0) {
+            Write-CrimsonBindLog -Message "Config.ini validation mismatches: $($val.MismatchDetails -join '; ')" -Level "Warning"
+        }
     } catch {
         $lblStatus.Text = "Error updating config.ini: $_"
         Write-CrimsonBindLog -Message "Set-ConfigIniFromRows failed: $_" -Level "Error"
@@ -1313,7 +1783,7 @@ $btnBackup.Add_Click({
     $account = $null
     if ($comboAccount.SelectedItem -and $comboAccount.SelectedItem -ne "(Pick account...)") { $account = $comboAccount.SelectedItem }
     try {
-        $result = New-CrimsonBackup -ConfigPath $Script:ConfigPath -WtfDir $Script:WtfDir -AccountName $account
+        $result = New-CrimsonBackup -ConfigPath $Script:ConfigPath -WtfDir $Script:WtfDir -AccountName $account -CsvPath $Script:CsvPath
         if ($result) {
             Update-BackupCombo -ComboBackup $comboBackup
             Update-BackupRestoreState -btnBackup $btnBackup -comboBackup $comboBackup -btnRestore $btnRestore
@@ -1367,6 +1837,18 @@ $btnSaveFromGrid.Add_Click({
 
 $btnExclusions.Add_Click({
     Show-ExclusionsDialog -StatusLabel $lblStatus -ExcludedKeysPath $Script:ExcludedKeysPath
+})
+
+$btnRandomizeSelected.Add_Click({
+    $filter = Get-CurrentFilterSection -ComboFilter $comboFilter
+    Sync-GridToRows -Grid $dgv -Rows $Script:AllRows -FilterSection $filter
+    $n = Invoke-RandomizeSelectedGridRows -Grid $dgv -Rows $Script:AllRows -FilterSection $filter
+    Update-GridFromRows -Grid $dgv -Rows $Script:AllRows -FilterSection $filter -SearchText $Script:GridSearchText
+    if ($n -gt 0) {
+        $lblStatus.Text = "Randomized $n selected row(s) to unique keys (no duplicates in section; General keys excluded for specs)."
+    } else {
+        $lblStatus.Text = "No rows randomized. Select one or more rows in the grid (skip rows that inherit key from General), then click Randomize selected."
+    }
 })
 
 $btnSearch.Add_Click({

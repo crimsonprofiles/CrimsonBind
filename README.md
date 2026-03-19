@@ -23,6 +23,20 @@ It supports **custom CSV formats**, making it adaptable beyond just Crimson conf
 
 Other sources may distribute modified or unsafe versions.
 
+---
+
+## Changelog
+
+### 1.02
+- **Update Debounce:** Fixed "Cannot index into a null array" when updating Debounce with a partial CSV (e.g. General + one spec). Root cause: `$newBindSections` was never initialized in `Export-DebounceFromRows`.
+- **Update Debounce:** Added defensive null-safety (initialized hashtables/arrays, safe iteration over bind sections and class tabs, null guards after reading existing Debounce file and in the success-path UI).
+- **Update Debounce:** On error, the status bar now shows the first line of the script stack trace to simplify debugging.
+
+### 1.01
+- General keybinds button, version in window titles, randomize skips General-bound actions, Debounce keys/macros and feedback, README and CSV updates (see earlier conversation).
+
+---
+
 - 🔍 The code is **fully readable (not obfuscated)**
 - 🛠 You are free to inspect and adapt it
 - 🔐 Always verify the source before running scripts

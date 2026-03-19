@@ -880,15 +880,20 @@ function Find-DebounceKeyValue {
     return @{ KeyStart = $m.Index; ValueStart = $valueStart; ValueLength = $valueLen }
 }
 
-# Build Lua for one bind entry (macrotext with name, value, icon, key). Key is normalized to config.ini format (+sc21_67701769) so Debounce receives same format as config.ini.
+# Build Lua for one bind entry (macrotext with name, value, icon, key). Debounce expects human-readable keys (e.g. CTRL-K, ALT-SHIFT-F), not config.ini encoded form.
+# Placeholder/instruction macro text must not be sent to addon as executable body (WoW can treat it as /say). Substitute safe no-op.
 function Get-DebounceBindLua {
     param($Row)
     $name = Get-LuaEscaped -s $Row.ActionName
-    $value = Get-LuaEscaped -s $Row.MacroText
+    $macroBody = if ($Row.MacroText) { $Row.MacroText.Trim() } else { "" }
+    if ($macroBody -match $Script:ConfigIniDescriptionMacroPattern -or $macroBody -match '§§') {
+        $macroBody = ""
+    }
+    $value = Get-LuaEscaped -s $macroBody
     $icon = 132089
     if ($Row.TextureID -match '^\d+$') { $icon = [int]$Row.TextureID }
-    $configKey = ConvertTo-ConfigIniKey -Key $Row.Key -Suffix $Script:ConfigIniKeySuffix
-    $key = Get-LuaEscaped -s $configKey
+    $keyStr = if ($Row.Key) { $Row.Key.Trim() } else { "" }
+    $key = Get-LuaEscaped -s $keyStr
     $lines = @(
         "{",
         "[""type""] = ""macrotext"",",
@@ -982,12 +987,17 @@ function Export-DebounceFromRows {
         [hashtable]$ExistingBindSections
     )
     if (-not $ExistingBindSections) { $ExistingBindSections = @{} }
+    $updatedSections = [System.Collections.ArrayList]::new()
+    $preservedSections = [System.Collections.ArrayList]::new()
+    $newBindSections = @{}
     $preserved = @{}
+    if (-not $Rows) { $Rows = [System.Collections.ArrayList]::new() }
     if (Test-Path -LiteralPath $Path -PathType Leaf) {
         $read = Read-DebounceFile -Path $Path
-        $preserved = $read.PreservedBlocks
-        foreach ($k in $read.BindSections.Keys) {
-            if (-not $ExistingBindSections[$k]) { $ExistingBindSections[$k] = $read.BindSections[$k] }
+        $preserved = if ($read -and $read.PreservedBlocks) { $read.PreservedBlocks } else { @{} }
+        $bindSections = if ($read -and $read.BindSections) { $read.BindSections } else { @{} }
+        foreach ($k in @($bindSections.Keys)) {
+            if (-not $ExistingBindSections[$k]) { $ExistingBindSections[$k] = $bindSections[$k] }
         }
     }
     $defaultCustomStates = "{" + "`r`n{" + "`r`n[""value""] = false," + "`r`n[""mode""] = 0," + "`r`n}," + "`r`n{" + "`r`n[""value""] = false," + "`r`n[""mode""] = 0," + "`r`n}," + "`r`n{" + "`r`n[""value""] = false," + "`r`n[""mode""] = 0," + "`r`n}," + "`r`n{" + "`r`n[""value""] = false," + "`r`n[""mode""] = 0," + "`r`n}," + "`r`n{" + "`r`n[""value""] = false," + "`r`n[""mode""] = 0," + "`r`n}," + "`r`n}"
@@ -1009,6 +1019,16 @@ function Export-DebounceFromRows {
     foreach ($r in $Rows) {
         if ($r.Section -eq "General") { $generalActionNames[$r.ActionName] = $true }
     }
+    # Always build GENERAL from CSV General section so macro text is correct (e.g. TargetEnemy) even when updating one spec only
+    $generalRows = [System.Collections.ArrayList]::new()
+    foreach ($r in $Rows) {
+        if ($r.Section -eq "General") { [void]$generalRows.Add($r) }
+    }
+    $bindCountBySection = @{}
+    if ($generalRows.Count -gt 0) {
+        $newBindSections["GENERAL"] = Get-DebounceGeneralSectionLua -Rows $generalRows
+        $bindCountBySection["GENERAL"] = $generalRows.Count
+    }
     $byClassTab = @{}
     foreach ($r in $rowsToUse) {
         $map = Get-DebounceSectionMapping -Section $r.Section
@@ -1019,26 +1039,35 @@ function Export-DebounceFromRows {
         if (-not $byClassTab[$ck][$tab]) { $byClassTab[$ck][$tab] = [System.Collections.ArrayList]::new() }
         [void]$byClassTab[$ck][$tab].Add($r)
     }
-    $newBindSections = @{}
-    foreach ($ck in $byClassTab.Keys) {
+    $classKeysToProcess = if ($byClassTab -and $byClassTab.Keys) { @($byClassTab.Keys) } else { @() }
+    foreach ($ck in $classKeysToProcess) {
         if ($ck -eq "GENERAL") {
             $allGeneral = [System.Collections.ArrayList]::new()
-            foreach ($idx in ($byClassTab["GENERAL"].Keys | Sort-Object)) {
-                foreach ($r in $byClassTab["GENERAL"][$idx]) { [void]$allGeneral.Add($r) }
+            $generalTab = $byClassTab["GENERAL"]
+            if ($generalTab -and $generalTab.Keys) {
+                foreach ($idx in ($generalTab.Keys | Sort-Object)) {
+                    foreach ($r in $generalTab[$idx]) { [void]$allGeneral.Add($r) }
+                }
             }
-            $newBindSections["GENERAL"] = Get-DebounceGeneralSectionLua -Rows $allGeneral
+            if (-not $newBindSections["GENERAL"]) {
+                $newBindSections["GENERAL"] = Get-DebounceGeneralSectionLua -Rows $allGeneral
+            }
             continue
         }
         $tabs = $byClassTab[$ck]
         $tabLuaByIndex = @{}
-        foreach ($idx in $tabs.Keys) {
+        $classBindCount = 0
+        $tabIndices = if ($tabs -and $tabs.Keys) { @($tabs.Keys) } else { @() }
+        foreach ($idx in $tabIndices) {
             $filtered = [System.Collections.ArrayList]::new()
             foreach ($r in $tabs[$idx]) {
                 if (-not $generalActionNames.ContainsKey($r.ActionName)) { [void]$filtered.Add($r) }
             }
+            $classBindCount += $filtered.Count
             $tabLuaByIndex[$idx] = Get-DebounceTabLua -Rows $filtered
         }
         $newBindSections[$ck] = Get-DebounceSectionTableLua -ClassKey $ck -TabsByIndex $tabLuaByIndex
+        $bindCountBySection[$ck] = $classBindCount
     }
 
     $classOrder = @("PALADIN", "ROGUE", "DEATHKNIGHT", "DEMONHUNTER", "DRUID", "EVOKER", "HUNTER", "MAGE", "MONK", "PRIEST", "SHAMAN", "WARLOCK", "WARRIOR")
@@ -1051,18 +1080,23 @@ function Export-DebounceFromRows {
         $useNew = $newBindSections[$c] -and (-not $OnlySection -or $onlyClass -eq $c)
         if ($useNew) {
             [void]$sb.AppendLine($newBindSections[$c])
+            [void]$updatedSections.Add($c)
         } elseif ($ExistingBindSections[$c]) {
             [void]$sb.AppendLine("[""$c""] = ")
             [void]$sb.AppendLine(($ExistingBindSections[$c].TrimEnd()) + ",")
+            [void]$preservedSections.Add($c)
         }
     }
     [void]$sb.AppendLine('["dbver"] = ' + $preserved["dbver"] + ',')
-    $useNewGeneral = $newBindSections["GENERAL"] -and (-not $OnlySection -or $onlyClass -eq "GENERAL")
+    # Always use CSV General when we built it so GENERAL tab macro text stays correct (e.g. TargetEnemy) on every update
+    $useNewGeneral = $newBindSections["GENERAL"]
     if ($useNewGeneral) {
         [void]$sb.AppendLine($newBindSections["GENERAL"])
+        [void]$updatedSections.Add("GENERAL")
     } elseif ($ExistingBindSections["GENERAL"]) {
         [void]$sb.AppendLine('["GENERAL"] = ')
         [void]$sb.AppendLine(($ExistingBindSections["GENERAL"].TrimEnd()) + ",")
+        [void]$preservedSections.Add("GENERAL")
     }
     [void]$sb.AppendLine('["options"] = ')
     [void]$sb.AppendLine($preserved["options"] + ",")
@@ -1071,6 +1105,12 @@ function Export-DebounceFromRows {
     [void]$sb.AppendLine('["dever"] = ' + $preserved["dever"])
     [void]$sb.AppendLine("}")
     [System.IO.File]::WriteAllText($Path, $sb.ToString(), [System.Text.Encoding]::UTF8)
+    return [PSCustomObject]@{
+        Path               = $Path
+        BindCountBySection = $bindCountBySection
+        UpdatedSections   = $updatedSections
+        PreservedSections  = $preservedSections
+    }
 }
 
 # ---------- GUI ----------
@@ -1363,7 +1403,7 @@ function Show-ExclusionsDialog {
 # Summary of changes: (1) TableLayoutPanel + FlowLayoutPanel for responsive layout and consistent padding. (2) Segoe UI 9pt. (3) Extracted GUI helpers and Exclusions dialog. (4) Input validation and user-facing error messages. (5) Optional logging when $Script:EnableLogging is $true.
 # Future improvements: tooltips on buttons; "Open folder" for config/CSV path; single-window layout (grid in tab or splitter); configurable paths in a small settings file.
 $form = New-Object System.Windows.Forms.Form
-$form.Text = "Crimson Binds 1.01"
+$form.Text = "Crimson Binds 1.02"
 $form.Size = New-Object System.Drawing.Size(740, 360)
 $form.StartPosition = "CenterScreen"
 $form.MinimumSize = New-Object System.Drawing.Size(520, 340)
@@ -1534,7 +1574,7 @@ $mainTable.SetColumnSpan($lblStatus, 3)
 
 # Data grid in a separate window (toolbar uses Panel; no GroupBox)
 $gridForm = New-Object System.Windows.Forms.Form
-$gridForm.Text = "Crimson Binds 1.01 - Data Grid (Section / Action / Key / MacroText)"
+$gridForm.Text = "Crimson Binds 1.02 - Data Grid (Section / Action / Key / MacroText)"
 $gridForm.Size = New-Object System.Drawing.Size(720, 420)
 $gridForm.StartPosition = [System.Windows.Forms.FormStartPosition]::Manual
 $gridForm.MinimumSize = New-Object System.Drawing.Size(400, 200)
@@ -1803,12 +1843,25 @@ $btnUpdateDebounce.Add_Click({
     $dir = [System.IO.Path]::GetDirectoryName($path)
     if (-not (Test-Path -LiteralPath $dir -PathType Container)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
     try {
-        Export-DebounceFromRows -Path $path -Rows $Script:AllRows -OnlySection $filter -ExistingBindSections $null
-        $scope = if ($filter) { "section '$filter'" } else { "all sections" }
-        $lblStatus.Text = "Updated Debounce.lua ($scope) at $path"
+        $summary = Export-DebounceFromRows -Path $path -Rows $Script:AllRows -OnlySection $filter -ExistingBindSections $null
+        $parts = [System.Collections.ArrayList]::new()
+        $toIterate = if ($summary -and $summary.UpdatedSections) { @($summary.UpdatedSections) } else { @() }
+        foreach ($sec in $toIterate) {
+            $n = if ($summary.BindCountBySection) { $summary.BindCountBySection[$sec] } else { $null }
+            if ($null -ne $n) { [void]$parts.Add("$sec ($n binds)") } else { [void]$parts.Add($sec) }
+        }
+        $updatedStr = if ($parts.Count -gt 0) { "Updated: " + ($parts -join ", ") } else { "No sections updated" }
+        $preservedStr = ""
+        if ($summary -and $summary.PreservedSections -and $summary.PreservedSections.Count -gt 0) {
+            $preservedStr = " | Preserved: " + ($summary.PreservedSections -join ", ")
+        }
+        $shortPath = if ($path.Length -gt 60) { "..." + $path.Substring([Math]::Max(0, $path.Length - 57)) } else { $path }
+        $lblStatus.Text = "Debounce: $updatedStr$preservedStr. $shortPath"
     } catch {
-        $lblStatus.Text = "Debounce error: $_"
-        Write-CrimsonBindLog -Message "Export-DebounceFromRows failed: $_" -Level "Error"
+        $trace = if ($_.ScriptStackTrace) { $_.ScriptStackTrace } else { "" }
+        $firstLine = if ($trace) { ($trace -split "`n")[0].Trim() } else { "" }
+        $lblStatus.Text = "Debounce error: $_" + $(if ($firstLine) { " At: $firstLine" } else { "" })
+        Write-CrimsonBindLog -Message "Export-DebounceFromRows failed: $_`n$trace" -Level "Error"
     }
 })
 

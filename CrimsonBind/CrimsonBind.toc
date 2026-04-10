@@ -1,0 +1,7 @@
+## Interface: 120000
+## Title: CrimsonBind
+## Notes: Retail only. Loads binds from SavedVariables (written by Sync-CrimsonBinds.ps1). /cb to open.
+## SavedVariables: CrimsonBindVars
+## Version: 1.0.0
+
+CrimsonBind.lua

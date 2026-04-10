@@ -47,6 +47,8 @@ local CB = {
   captureBanner = nil,
   iconCache = {},
   heatmapFrame = nil,
+  pendingIconId = nil,
+  iconPickerFrame = nil,
 }
 
 local COL_STATUS = 14
@@ -1931,6 +1933,195 @@ local function CrimsonBind_RequestApply()
 end
 
 -- =========================
+-- UI: Icon Picker
+-- =========================
+
+local function collectSpellbookIcons()
+  local icons = {}
+  local seen = {}
+  if C_SpellBook and C_SpellBook.GetNumSpellBookSkillLines then
+    local numTabs = C_SpellBook.GetNumSpellBookSkillLines()
+    for tab = 1, numTabs do
+      local info = C_SpellBook.GetSpellBookSkillLineInfo(tab)
+      if info then
+        for i = info.itemIndexOffset + 1, info.itemIndexOffset + info.numSpellBookItems do
+          local si = C_SpellBook.GetSpellBookItemInfo(i, Enum.SpellBookSpellBank.Player)
+          if si and si.iconID and not seen[si.iconID] then
+            seen[si.iconID] = true
+            table.insert(icons, { id = si.iconID, name = si.name or "" })
+          end
+        end
+      end
+    end
+  end
+  table.sort(icons, function(a, b) return a.name < b.name end)
+  return icons
+end
+
+local ICON_COLS = 8
+local ICON_CELL = 36
+local ICON_GAP  = 2
+
+local function createIconPickerFrame(parent)
+  local popup = CreateFrame("Frame", "CrimsonBindIconPickerFrame", parent, "BackdropTemplate")
+  popup:SetSize(ICON_COLS * (ICON_CELL + ICON_GAP) + 24, 340)
+  popup:SetPoint("TOPLEFT", parent, "TOPRIGHT", 6, 0)
+  popup:SetFrameStrata("TOOLTIP")
+  popup:SetFrameLevel(parent:GetFrameLevel() + 30)
+  popup:SetBackdrop({
+    bgFile   = "Interface\\DialogFrame\\UI-DialogBox-Background",
+    edgeFile = "Interface\\DialogFrame\\UI-DialogBox-Border",
+    tile = true, tileSize = 32, edgeSize = 16,
+    insets = { left = 8, right = 8, top = 8, bottom = 8 },
+  })
+  popup:Hide()
+  popup:EnableMouse(true)
+
+  -- Close button
+  local btnClose = CreateFrame("Button", nil, popup, "UIPanelCloseButton")
+  btnClose:SetSize(20, 20)
+  btnClose:SetPoint("TOPRIGHT", -4, -4)
+  btnClose:SetScript("OnClick", function() popup:Hide() end)
+
+  -- Search field
+  local searchBg = CreateFrame("Frame", nil, popup, "BackdropTemplate")
+  searchBg:SetPoint("TOPLEFT", 12, -12)
+  searchBg:SetPoint("TOPRIGHT", -28, -12)
+  searchBg:SetHeight(22)
+  searchBg:SetBackdrop({
+    bgFile = "Interface\\Tooltips\\UI-Tooltip-Background",
+    edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
+    tile = true, tileSize = 8, edgeSize = 8,
+    insets = { left = 2, right = 2, top = 2, bottom = 2 },
+  })
+  searchBg:SetBackdropColor(0, 0, 0, 0.8)
+
+  local searchBox = CreateFrame("EditBox", nil, searchBg)
+  searchBox:SetAllPoints()
+  searchBox:SetFontObject("GameFontNormalSmall")
+  searchBox:SetTextInsets(4, 4, 2, 2)
+  searchBox:SetAutoFocus(false)
+  searchBox:SetMaxLetters(64)
+  searchBox:EnableMouse(true)
+
+  local searchHint = searchBg:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
+  searchHint:SetPoint("LEFT", searchBg, "LEFT", 6, 0)
+  searchHint:SetText("Search spells…")
+
+  searchBox:SetScript("OnTextChanged", function(self)
+    local txt = self:GetText()
+    searchHint:SetShown(txt == "")
+    if popup.filterIcons then popup.filterIcons(txt) end
+  end)
+  searchBox:SetScript("OnEscapePressed", function(self) self:ClearFocus() popup:Hide() end)
+
+  -- Scroll frame for icon grid
+  local scrollFrame = CreateFrame("ScrollFrame", nil, popup, "UIPanelScrollFrameTemplate")
+  scrollFrame:SetPoint("TOPLEFT", 12, -38)
+  scrollFrame:SetPoint("BOTTOMRIGHT", -28, 36)
+
+  local content = CreateFrame("Frame", nil, scrollFrame)
+  content:SetWidth(ICON_COLS * (ICON_CELL + ICON_GAP))
+  content:SetHeight(1)
+  scrollFrame:SetScrollChild(content)
+
+  -- Auto button at bottom
+  local btnAuto = CreateFrame("Button", nil, popup, "UIPanelButtonTemplate")
+  btnAuto:SetSize(60, 22)
+  btnAuto:SetPoint("BOTTOMLEFT", 12, 8)
+  btnAuto:SetText("Auto")
+  btnAuto:SetScript("OnClick", function()
+    local editorText = CB.editorMacroEdit and CB.editorMacroEdit:GetText() or ""
+    if editorText == "" then
+      print("|cff00ccffCrimsonBind|r No macro text to resolve icon from.")
+      return
+    end
+    local snapshot = { macroText = editorText, textureId = 0 }
+    local iconId = resolveIconForBind(snapshot)
+    CB.pendingIconId = iconId
+    if CB.editorIcon then CB.editorIcon:SetTexture(iconId) end
+    popup:Hide()
+  end)
+
+  local btnCancel = CreateFrame("Button", nil, popup, "UIPanelButtonTemplate")
+  btnCancel:SetSize(60, 22)
+  btnCancel:SetPoint("BOTTOMRIGHT", -12, 8)
+  btnCancel:SetText("Cancel")
+  btnCancel:SetScript("OnClick", function() popup:Hide() end)
+
+  -- Pool of reusable cell buttons
+  local cells = {}
+
+  local function buildCells(iconList)
+    for _, cell in ipairs(cells) do cell:Hide() end
+    local row, col = 0, 0
+    local used = 0
+    for i, entry in ipairs(iconList) do
+      local cell = cells[i]
+      if not cell then
+        cell = CreateFrame("Button", nil, content)
+        cell:SetSize(ICON_CELL, ICON_CELL)
+        local tex = cell:CreateTexture(nil, "ARTWORK")
+        tex:SetAllPoints()
+        cell.tex = tex
+        cell:SetHighlightTexture("Interface\\Buttons\\ButtonHilight-Square", "ADD")
+        cell:SetScript("OnEnter", function(self)
+          GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+          GameTooltip:SetText(self.spellName or "", 1, 1, 1, 1, true)
+          GameTooltip:Show()
+        end)
+        cell:SetScript("OnLeave", function() GameTooltip:Hide() end)
+        cells[i] = cell
+      end
+      cell.tex:SetTexture(entry.id)
+      cell.spellName = entry.name
+      local iconId = entry.id
+      cell:SetScript("OnClick", function()
+        CB.pendingIconId = iconId
+        if CB.editorIcon then CB.editorIcon:SetTexture(iconId) end
+        popup:Hide()
+      end)
+      cell:SetPoint("TOPLEFT", col * (ICON_CELL + ICON_GAP), -row * (ICON_CELL + ICON_GAP))
+      cell:Show()
+      col = col + 1
+      if col >= ICON_COLS then col = 0; row = row + 1 end
+      used = i
+    end
+    local totalRows = math.ceil(used / ICON_COLS)
+    content:SetHeight(math.max(1, totalRows * (ICON_CELL + ICON_GAP)))
+    scrollFrame:SetVerticalScroll(0)
+  end
+
+  local allIcons = {}
+
+  popup.filterIcons = function(query)
+    if query == nil or query == "" then
+      buildCells(allIcons)
+    else
+      local q = strlower(query)
+      local filtered = {}
+      for _, e in ipairs(allIcons) do
+        if strsub(strlower(e.name), 1, #q) == q or strlower(e.name):find(q, 1, true) then
+          table.insert(filtered, e)
+        end
+      end
+      buildCells(filtered)
+    end
+  end
+
+  popup.refresh = function()
+    allIcons = collectSpellbookIcons()
+    searchBox:SetText("")
+    searchHint:Show()
+    buildCells(allIcons)
+    scrollFrame:SetVerticalScroll(0)
+  end
+
+  CB.iconPickerFrame = popup
+  return popup
+end
+
+-- =========================
 -- UI: Editor frame
 -- =========================
 
@@ -1950,10 +2141,62 @@ local function createBindEditorFrame(parent)
   })
   ed:Hide()
 
-  CB.editorIcon = ed:CreateTexture(nil, "ARTWORK")
-  CB.editorIcon:SetSize(32, 32)
-  CB.editorIcon:SetPoint("TOPLEFT", 12, -10)
+  CB.editorIconBtn = CreateFrame("Button", nil, ed)
+  CB.editorIconBtn:SetSize(36, 36)
+  CB.editorIconBtn:SetPoint("TOPLEFT", 10, -8)
+  CB.editorIconBtn:SetHighlightTexture("Interface\\Buttons\\ButtonHilight-Square", "ADD")
+  CB.editorIconBtn:RegisterForClicks("AnyUp")
+  CB.editorIconBtn:Hide()
+
+  CB.editorIcon = CB.editorIconBtn:CreateTexture(nil, "ARTWORK")
+  CB.editorIcon:SetAllPoints()
   CB.editorIcon:SetTexture(QUESTION_MARK_ICON)
+
+  CB.editorIconBtn:SetScript("OnClick", function(self, btn)
+    if btn == "RightButton" then
+      CB.pendingIconId = 0
+      local idx = CB.editorBindIndex
+      local b = idx and CrimsonBindVars.binds[idx]
+      local snapshot = b and { macroText = b.macroText or "", textureId = 0 } or { macroText = "", textureId = 0 }
+      local editorText = CB.editorMacroEdit and CB.editorMacroEdit:GetText() or ""
+      if editorText ~= "" then snapshot.macroText = editorText end
+      CB.editorIcon:SetTexture(resolveIconForBind(snapshot))
+      if CB.iconPickerFrame then CB.iconPickerFrame:Hide() end
+    else
+      if CB.iconPickerFrame then
+        if CB.iconPickerFrame:IsShown() then
+          CB.iconPickerFrame:Hide()
+        else
+          CB.iconPickerFrame.refresh()
+          CB.iconPickerFrame:Show()
+        end
+      end
+    end
+  end)
+  CB.editorIconBtn:SetScript("OnEnter", function(self)
+    GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+    GameTooltip:SetText("Left-click: pick icon\nRight-click: reset to auto", 1, 1, 1, 1, true)
+    GameTooltip:Show()
+  end)
+  CB.editorIconBtn:SetScript("OnLeave", function() GameTooltip:Hide() end)
+
+  -- Standalone "Auto" button next to the icon button
+  CB.editorAutoBtn = CreateFrame("Button", nil, ed, "UIPanelButtonTemplate")
+  CB.editorAutoBtn:SetSize(44, 22)
+  CB.editorAutoBtn:SetPoint("LEFT", CB.editorIconBtn, "RIGHT", 4, 0)
+  CB.editorAutoBtn:SetText("Auto")
+  CB.editorAutoBtn:Hide()
+  CB.editorAutoBtn:SetScript("OnClick", function()
+    local editorText = CB.editorMacroEdit and CB.editorMacroEdit:GetText() or ""
+    if editorText == "" then
+      print("|cff00ccffCrimsonBind|r No macro text to resolve icon from.")
+      return
+    end
+    local snapshot = { macroText = editorText, textureId = 0 }
+    local iconId = resolveIconForBind(snapshot)
+    CB.pendingIconId = iconId
+    CB.editorIcon:SetTexture(iconId)
+  end)
 
   local title = ed:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
   title:SetPoint("TOP", 16, -18)
@@ -2115,6 +2358,10 @@ local function createBindEditorFrame(parent)
     end
     b.key = newKey
     b.macroText = newMacro
+    if isCustom and CB.pendingIconId ~= nil then
+      b.textureId = CB.pendingIconId
+    end
+    CB.pendingIconId = nil
     local newMacNorm = normalizeStoredMacroText(newMacro)
     if newMacNorm ~= "" then CB.iconCache[newMacNorm] = nil end
     if not CB.applyAll() then
@@ -2122,6 +2369,7 @@ local function createBindEditorFrame(parent)
     end
     buildValidationMeta()
     refreshList()
+    if CB.iconPickerFrame then CB.iconPickerFrame:Hide() end
     ed:Hide()
     print("|cff00ccffCrimsonBind|r Saved bind: " .. tostring(b.actionName))
   end)
@@ -2141,6 +2389,8 @@ local function createBindEditorFrame(parent)
   btnCancel:SetPoint("LEFT", btnRevert, "RIGHT", 6, 0)
   btnCancel:SetText("Cancel")
   btnCancel:SetScript("OnClick", function()
+    if CB.iconPickerFrame then CB.iconPickerFrame:Hide() end
+    CB.pendingIconId = nil
     ed:Hide()
   end)
 
@@ -2252,9 +2502,18 @@ local function createBindEditorFrame(parent)
     CB.editorKeyEdit:SetText(CB.editorSnapshotKey)
     CB.editorMacroEdit:SetText(CB.editorSnapshotMacro)
     updateEditorCharCount()
+    -- Icon button: only shown and clickable for CUSTOM rows
+    CB.pendingIconId = (b.textureId and b.textureId ~= 0) and b.textureId or nil
+    if CB.editorIconBtn then
+      CB.editorIconBtn:SetShown(isCustom)
+    end
+    if CB.editorAutoBtn then
+      CB.editorAutoBtn:SetShown(isCustom)
+    end
     if CB.editorIcon then
       CB.editorIcon:SetTexture(resolveIconForBind(b))
     end
+    if CB.iconPickerFrame then CB.iconPickerFrame:Hide() end
     ed:Show()
   end
 end
@@ -2995,6 +3254,7 @@ local function createUI()
   hint:SetText("Shift+click row = place on bar | /cb test toggles test mode | /cb heatmap")
 
   createBindEditorFrame(f)
+  createIconPickerFrame(CrimsonBindEditorFrame)
 
   f:Hide()
   CB.frame = f

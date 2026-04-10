@@ -535,7 +535,29 @@ function Export-CrimsonBindCsvTableUtf8Quoted {
                 (Escape-CsvField $ky)
             ) -join ',')
     }
-    [System.IO.File]::WriteAllText($Path, $sb.ToString().TrimEnd() + "`r`n", $enc)
+    $content = $sb.ToString().TrimEnd() + "`r`n"
+    # Write to a sibling .tmp first (nothing else has it open), then overwrite
+    # the real CSV using File.Copy(overwrite=true). Copy is more reliable than
+    # Move-Item on Windows when the destination file already exists.
+    $tmpPath = $Path + ".tmp"
+    [System.IO.File]::WriteAllText($tmpPath, $content, $enc)
+    $maxAttempts = 8
+    $attempt = 0
+    while ($true) {
+        $attempt++
+        try {
+            [System.IO.File]::Copy($tmpPath, $Path, $true)
+            break
+        } catch [System.IO.IOException] {
+            if ($attempt -ge $maxAttempts) {
+                try { [System.IO.File]::Delete($tmpPath) } catch {}
+                throw [System.Exception]::new(
+                    "Could not replace '$Path' after $maxAttempts attempts - close any program (Excel, editor) that has the file open, then try again.`nOriginal: $($_.Exception.Message)")
+            }
+            Start-Sleep -Milliseconds (200 * $attempt)
+        }
+    }
+    try { [System.IO.File]::Delete($tmpPath) } catch {}
 }
 
 function Apply-TargetMemberDefaultMacrosToCsvTable {
@@ -2491,9 +2513,18 @@ function Show-SyncCrimsonBindsMainForm {
             $lblStatus.Text = "Select a valid config.ini path."
             return
         }
+        $btnLoad.Enabled = $false
+        $btnRand.Enabled = $false
+        $btnLoad.Text = "Loading..."
+        [System.Windows.Forms.Application]::DoEvents()
         try {
+            $lblStatus.Text = "Loading config.ini..."
+            [System.Windows.Forms.Application]::DoEvents()
             $rows = Get-SyncConfigIniRows -ConfigPath $cfg
             Update-SyncRowsDecodedKeys -Rows $rows
+
+            $lblStatus.Text = "Merging CSV macros..."
+            [System.Windows.Forms.Application]::DoEvents()
             $csvPath = $tbCsv.Text.Trim()
             if (-not $csvPath) { $csvPath = Get-CrimsonBindCsvDefaultPath -ConfigPath $cfg }
             $mf = Merge-CrimsonBindCsvMacrosIntoRows -Rows $rows -CsvPath $csvPath
@@ -2512,6 +2543,10 @@ function Show-SyncCrimsonBindsMainForm {
             }
         } catch {
             $lblStatus.Text = "Load failed: $($_.Exception.Message)"
+        } finally {
+            $btnLoad.Enabled = $true
+            $btnRand.Enabled = $true
+            $btnLoad.Text = "Load config.ini"
         }
     })
 
@@ -2533,10 +2568,22 @@ function Show-SyncCrimsonBindsMainForm {
             $lblStatus.Text = "Set WoW SavedVariables folder (or add WTFPath= under [Main] in config.ini)."
             return
         }
+
+        # Disable buttons and show working state so the UI doesn't appear frozen
+        $btnRand.Enabled = $false
+        $btnLoad.Enabled = $false
+        $btnRand.Text = "Working..."
+        [System.Windows.Forms.Application]::DoEvents()
+
         $csvBk = $tbCsv.Text.Trim(); if (-not $csvBk) { $csvBk = Get-CrimsonBindCsvDefaultPath -ConfigPath $cfg }
-        New-CrimsonBindBackup -ConfigPath $cfg -CsvPath $csvBk -KeyPoolPath $poolPath -SavedVarsDir $wtf | Out-Null
         try {
+            $lblStatus.Text = "Step 1/7 - Creating backup..."
+            [System.Windows.Forms.Application]::DoEvents()
+            New-CrimsonBindBackup -ConfigPath $cfg -CsvPath $csvBk -KeyPoolPath $poolPath -SavedVarsDir $wtf | Out-Null
+
             if (-not $Script:SyncRows) {
+                $lblStatus.Text = "Step 2/7 - Loading config.ini..."
+                [System.Windows.Forms.Application]::DoEvents()
                 $rows = Get-SyncConfigIniRows -ConfigPath $cfg
                 Update-SyncRowsDecodedKeys -Rows $rows
                 $csvBoot = $tbCsv.Text.Trim()
@@ -2545,22 +2592,29 @@ function Show-SyncCrimsonBindsMainForm {
                 [void](Merge-CrimsonBindCsvCustomRowsIntoSyncRows -SyncRows $rows -CsvPath $csvBoot)
                 $Script:SyncRows = $rows
                 Update-SectionCombo
+            } else {
+                $lblStatus.Text = "Step 2/7 - Rows already loaded, skipping..."
+                [System.Windows.Forms.Application]::DoEvents()
             }
+
             if ($Script:SyncRows.Count -eq 0) {
                 $lblStatus.Text = "No bind rows to randomize. Click Load config.ini first or fix config content."
                 return
             }
+
             # Compute which sections to randomize from CheckedListBox
             $onlySections = $null
             $checkedItems = @($clbSec.CheckedItems)
             if ($checkedItems.Count -gt 0 -and -not ($checkedItems -contains "(All sections)")) {
                 $onlySections = [string[]]($checkedItems | Where-Object { $_ -ne "(All sections)" -and $_ -ine "CUSTOM" })
-                # Auto-include General if specific specs selected and General exists in data
                 $hasGeneralRows = @($Script:SyncRows | Where-Object { $_.Section -eq "General" }).Count -gt 0
                 if ($hasGeneralRows -and $onlySections -notcontains "General") {
                     $onlySections = @("General") + $onlySections
                 }
             }
+
+            $lblStatus.Text = "Step 3/7 - Merging CSV macros..."
+            [System.Windows.Forms.Application]::DoEvents()
             $rowsCopy = [System.Collections.ArrayList]::new()
             foreach ($x in $Script:SyncRows) {
                 if ($null -eq $x) { continue }
@@ -2571,23 +2625,39 @@ function Show-SyncCrimsonBindsMainForm {
             $csvPath = $tbCsv.Text.Trim()
             if (-not $csvPath) { $csvPath = Get-CrimsonBindCsvDefaultPath -ConfigPath $cfg }
             $mf = Merge-CrimsonBindCsvMacrosIntoRows -Rows $rowsCopy -CsvPath $csvPath
+
+            $secLabel = if ($onlySections) { $onlySections -join ", " } else { "all sections" }
+            $lblStatus.Text = "Step 4/7 - Randomizing keys ($secLabel)..."
+            [System.Windows.Forms.Application]::DoEvents()
             Invoke-SyncRandomizeKeys -Rows $rowsCopy -OnlySections $onlySections -KeyPoolPath $poolPath -CrimsonBindCsvPath $csvPath
-            # -ForceGeneralIniKeys: user explicitly asked to randomize, so write keys even into previously-empty [General] lines.
+
+            $lblStatus.Text = "Step 5/7 - Writing config.ini..."
+            [System.Windows.Forms.Application]::DoEvents()
             $n = Set-ConfigIniFromRows -ConfigPath $cfg -Rows $rowsCopy -ForceGeneralIniKeys
             Update-SyncRowsDecodedKeys -Rows $rowsCopy
             $Script:SyncRows = $rowsCopy
+
+            $lblStatus.Text = "Step 6/7 - Writing CrimsonBind.lua..."
+            [System.Windows.Forms.Application]::DoEvents()
             $out = Join-Path $wtf "CrimsonBind.lua"
             Write-CrimsonBindVarsLuaFile -OutPath $out -Rows $Script:SyncRows
             Write-SyncPathsIni -ConfigIni $cfg -WoWSavedVariables $wtf -KeyPoolFile $poolPath -CrimsonBindCsv $tbCsv.Text.Trim()
+
+            $lblStatus.Text = "Step 7/7 - Updating CSV keys..."
+            [System.Windows.Forms.Application]::DoEvents()
             $keyWrites = Write-CrimsonBindCsvKeysFromSyncRows -Rows $Script:SyncRows -CsvPath $csvPath
+
             $csvKeyNote = if ($keyWrites -gt 0) { " CSV: $keyWrites Key cell(s) updated." } else { "" }
-            $secLabel = if ($onlySections) { $onlySections -join ", " } else { "all sections" }
             $mfNote = if ($mf -gt 0) { " Merged $mf macro field(s) from CSV before randomize." } else { "" }
-            $lblStatus.Text = "Randomized ($secLabel); config.ini lines touched: $n$mfNote$csvKeyNote`nWrote CrimsonBind.lua"
+            $lblStatus.Text = "Done - Randomized ($secLabel); config.ini lines touched: $n$mfNote$csvKeyNote`nWrote CrimsonBind.lua"
         } catch {
             $ex = $_.Exception.Message
             $pos = if ($_.InvocationInfo.PositionMessage) { "`n" + $_.InvocationInfo.PositionMessage.Trim() } else { "" }
             $lblStatus.Text = "Randomize failed: $ex$pos"
+        } finally {
+            $btnRand.Enabled = $true
+            $btnLoad.Enabled = $true
+            $btnRand.Text = "Randomize + Sync"
         }
     })
 
